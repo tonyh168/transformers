@@ -1,0 +1,577 @@
+<title>Transformers 精读地图</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@600;700;900&display=swap">
+
+<style>
+/* ── tokens ───────────────────────────────────────────── */
+:root{
+  --ground:#F6F7F9; --surface:#FFFFFF; --surface-2:#EFF3F6;
+  --ink:#141C25; --ink-2:#5C6975; --ink-3:#8B97A3;
+  --rule:#DCE2E8; --rule-2:#C6CFD8;
+  --accent:#1C6C88; --accent-soft:#E4EEF3; --accent-ink:#12536A;
+  --warn:#9C5208; --warn-soft:#F8EDE1;
+  --ok:#2E6A4E; --ok-soft:#E4EFE9;
+  --q1a:#1C6C88; --q1m:#494E8E; --q2a:#7A3E63; --q2m:#96462C;
+  --shadow:0 1px 2px rgba(20,28,37,.05), 0 10px 28px -14px rgba(20,28,37,.22);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#0F151C; --surface:#161E27; --surface-2:#1B2531;
+    --ink:#E3E9EF; --ink-2:#97A5B2; --ink-3:#6E7C8A;
+    --rule:#28333E; --rule-2:#3A4753;
+    --accent:#63B6D2; --accent-soft:#172A34; --accent-ink:#8FCDE3;
+    --warn:#E2A45C; --warn-soft:#2C2318;
+    --ok:#74C39B; --ok-soft:#16271F;
+    --q1a:#63B6D2; --q1m:#98A2E0; --q2a:#CB8DB2; --q2m:#DB926D;
+    --shadow:0 1px 2px rgba(0,0,0,.35), 0 10px 28px -14px rgba(0,0,0,.65);
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#0F151C; --surface:#161E27; --surface-2:#1B2531;
+  --ink:#E3E9EF; --ink-2:#97A5B2; --ink-3:#6E7C8A;
+  --rule:#28333E; --rule-2:#3A4753;
+  --accent:#63B6D2; --accent-soft:#172A34; --accent-ink:#8FCDE3;
+  --warn:#E2A45C; --warn-soft:#2C2318;
+  --ok:#74C39B; --ok-soft:#16271F;
+  --q1a:#63B6D2; --q1m:#98A2E0; --q2a:#CB8DB2; --q2m:#DB926D;
+  --shadow:0 1px 2px rgba(0,0,0,.35), 0 10px 28px -14px rgba(0,0,0,.65);
+}
+
+/* ── base ─────────────────────────────────────────────── */
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--ground); color:var(--ink);
+  font-family:"IBM Plex Sans","Noto Sans SC",system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+  font-size:15.5px; line-height:1.72;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1080px; margin:0 auto; padding-block:0 88px; padding-inline:20px}
+code,.mono{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.885em}
+h1,h2,h3{font-family:"Noto Serif SC","IBM Plex Sans",serif; text-wrap:balance; margin:0; line-height:1.3}
+p{margin:0}
+a{color:var(--accent-ink)}
+:focus-visible{outline:2px solid var(--accent); outline-offset:2px; border-radius:3px}
+@media (prefers-reduced-motion:reduce){*{animation:none!important; transition:none!important}}
+
+/* ── sticky bar ───────────────────────────────────────── */
+.bar{
+  position:sticky; top:0; z-index:20;
+  background:color-mix(in srgb, var(--ground) 88%, transparent);
+  backdrop-filter:blur(10px); border-bottom:1px solid var(--rule);
+}
+.bar-in{max-width:1080px; margin:0 auto; padding:10px 20px; display:flex; align-items:center; gap:16px; flex-wrap:wrap}
+.bar-mark{font-family:"IBM Plex Mono",monospace; font-size:11.5px; font-weight:600; letter-spacing:.14em; text-transform:uppercase; color:var(--ink-2)}
+.meter{flex:1 1 150px; min-width:120px; height:6px; background:var(--surface-2); border-radius:99px; overflow:hidden; border:1px solid var(--rule)}
+.meter i{display:block; height:100%; width:0; background:var(--accent); border-radius:99px; transition:width .35s ease}
+.bar-count{font-family:"IBM Plex Mono",monospace; font-size:12.5px; font-variant-numeric:tabular-nums; color:var(--ink-2); white-space:nowrap}
+.tgl{display:inline-flex; align-items:center; gap:7px; font-size:13px; color:var(--ink-2); cursor:pointer; user-select:none; white-space:nowrap}
+.tgl input{appearance:none; width:32px; height:18px; border-radius:99px; background:var(--rule-2); position:relative; cursor:pointer; transition:background .2s}
+.tgl input::after{content:""; position:absolute; top:2px; left:2px; width:14px; height:14px; border-radius:50%; background:var(--surface); transition:transform .2s}
+.tgl input:checked{background:var(--accent)}
+.tgl input:checked::after{transform:translateX(14px)}
+
+/* ── hero ─────────────────────────────────────────────── */
+.hero{padding-block:52px 34px; border-bottom:1px solid var(--rule)}
+.eyebrow{font-family:"IBM Plex Mono",monospace; font-size:11.5px; font-weight:600; letter-spacing:.16em; text-transform:uppercase; color:var(--accent); margin-bottom:16px}
+.hero h1{font-size:clamp(34px,6vw,52px); font-weight:900; letter-spacing:-.015em}
+.hero .lede{margin-top:18px; max-width:63ch; color:var(--ink-2); font-size:16.5px}
+.hero .lede b{color:var(--ink); font-weight:600}
+.stats{display:flex; flex-wrap:wrap; gap:0; margin-top:30px; border:1px solid var(--rule); border-radius:10px; background:var(--surface); overflow:hidden; box-shadow:var(--shadow)}
+.stat{flex:1 1 130px; padding:15px 20px; border-inline-start:1px solid var(--rule)}
+.stat:first-child{border-inline-start:0}
+.stat b{display:block; font-family:"IBM Plex Mono",monospace; font-size:25px; font-weight:600; font-variant-numeric:tabular-nums; letter-spacing:-.02em; color:var(--accent-ink)}
+.stat span{display:block; margin-top:3px; font-size:12.5px; color:var(--ink-3)}
+
+/* ── sections ─────────────────────────────────────────── */
+section{padding-block:46px 6px; scroll-margin-top:64px}
+.sec-head{display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; border-bottom:2px solid var(--ink); padding-bottom:11px; margin-bottom:24px}
+.sec-head h2{font-size:24px; font-weight:700}
+.sec-head .note{margin-inline-start:auto; font-size:13px; color:var(--ink-3)}
+
+/* ── paths ────────────────────────────────────────────── */
+.paths{display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(290px,1fr))}
+.path{border:1px solid var(--rule); border-radius:10px; background:var(--surface); padding:17px 18px 19px; box-shadow:var(--shadow); display:flex; flex-direction:column; gap:11px}
+.path h3{font-size:15.5px; font-weight:700; font-family:"IBM Plex Sans","Noto Sans SC",sans-serif}
+.path .sub{font-size:12.5px; color:var(--ink-3); margin-top:-7px}
+.chain{display:flex; flex-wrap:wrap; align-items:center; gap:5px}
+.chip{
+  font-family:"IBM Plex Mono",monospace; font-size:12px; font-weight:500;
+  padding:3px 8px; border-radius:5px; border:1px solid var(--rule-2);
+  background:var(--surface-2); color:var(--ink-2); cursor:pointer;
+  transition:background .15s, color .15s, border-color .15s;
+}
+.chip:hover{border-color:var(--accent); color:var(--accent-ink); background:var(--accent-soft)}
+.chip.done{background:var(--ok-soft); border-color:color-mix(in srgb,var(--ok) 40%,transparent); color:var(--ok)}
+.arrow{color:var(--ink-3); font-size:11px}
+.path .why{font-size:12.5px; color:var(--ink-2); border-top:1px dashed var(--rule); padding-top:9px; margin-top:auto}
+
+/* ── quadrants ────────────────────────────────────────── */
+.quad{border:1px solid var(--rule); border-radius:11px; background:var(--surface); overflow:hidden; box-shadow:var(--shadow); margin-bottom:16px}
+.quad-head{display:flex; align-items:center; gap:11px; padding:13px 18px; border-bottom:1px solid var(--rule); background:var(--surface-2); border-inline-start:3px solid var(--q)}
+.quad-head .qid{font-family:"IBM Plex Mono",monospace; font-size:12px; font-weight:600; padding:2px 7px; border-radius:4px; background:color-mix(in srgb,var(--q) 15%,transparent); color:var(--q)}
+.quad-head h3{font-size:16px; font-weight:700}
+.quad-head .goal{margin-inline-start:auto; font-size:12.5px; color:var(--ink-3); text-align:right}
+.q1a{--q:var(--q1a)} .q1m{--q:var(--q1m)} .q2a{--q:var(--q2a)} .q2m{--q:var(--q2m)}
+
+.rows{display:flex; flex-direction:column}
+.row{
+  display:grid; grid-template-columns:26px 1fr auto; gap:6px 13px; align-items:start;
+  padding:13px 18px; border-top:1px solid var(--rule); scroll-margin-top:120px;
+}
+.row:first-child{border-top:0}
+.row.hit{animation:hit 1.5s ease}
+@keyframes hit{0%,55%{background:var(--accent-soft)}100%{background:transparent}}
+.row input[type=checkbox]{
+  appearance:none; width:17px; height:17px; margin-top:4px; border:1.5px solid var(--rule-2);
+  border-radius:4px; background:var(--surface); cursor:pointer; position:relative; flex:none;
+}
+.row input[type=checkbox]:checked{background:var(--ok); border-color:var(--ok)}
+.row input[type=checkbox]:checked::after{
+  content:""; position:absolute; left:5px; top:1px; width:4px; height:9px;
+  border-right:2px solid var(--surface); border-bottom:2px solid var(--surface); transform:rotate(42deg);
+}
+.row-body{min-width:0}
+.row-title{display:flex; align-items:baseline; gap:8px; flex-wrap:wrap}
+.row-title .num{font-family:"IBM Plex Mono",monospace; font-size:12.5px; font-weight:600; color:var(--q)}
+.row-title strong{font-size:15px; font-weight:700}
+.row-title .status{font-size:11px; font-family:"IBM Plex Mono",monospace; color:var(--ink-3)}
+.row-desc{font-size:13.5px; color:var(--ink-2); margin-top:3px}
+.dupe{
+  font-family:"IBM Plex Mono",monospace; font-size:11.5px; color:var(--ink-3);
+  background:none; border:0; border-bottom:1px dashed var(--rule-2); padding:1px 0;
+  cursor:pointer; white-space:nowrap; align-self:start; margin-top:4px;
+}
+.dupe:hover{color:var(--accent-ink); border-color:var(--accent)}
+.row.done .row-title strong,.row.done .row-desc{color:var(--ink-3)}
+body.hide-done .row.done{display:none}
+
+/* ── findings ─────────────────────────────────────────── */
+.fgroup{margin-bottom:22px}
+.fgroup > h3{font-size:14px; font-weight:700; margin-bottom:9px; display:flex; align-items:center; gap:9px}
+.fgroup > h3 .tag{
+  font-family:"IBM Plex Mono",monospace; font-size:10.5px; font-weight:600; letter-spacing:.08em;
+  text-transform:uppercase; padding:2px 7px; border-radius:4px; background:var(--warn-soft); color:var(--warn);
+}
+.fgroup > h3 .cnt{font-family:"IBM Plex Mono",monospace; font-size:12px; color:var(--ink-3); font-weight:400}
+.ftable{width:100%; border-collapse:collapse; border:1px solid var(--rule); border-radius:9px; overflow:hidden; background:var(--surface); font-size:13.5px}
+.ftable th{background:var(--surface-2); text-align:left; font-size:11.5px; font-family:"IBM Plex Mono",monospace; font-weight:600; letter-spacing:.07em; text-transform:uppercase; color:var(--ink-2); padding:8px 13px; border-bottom:1px solid var(--rule)}
+.ftable td{padding:10px 13px; border-bottom:1px solid var(--rule); vertical-align:top; line-height:1.6}
+.ftable tr:last-child td{border-bottom:0}
+.ftable td:first-child{color:var(--ink-2); width:31%}
+.ftable td:nth-child(2){color:var(--ink)}
+.ftable td:nth-child(2) b{color:var(--warn); font-weight:600}
+.ftable td:last-child{font-family:"IBM Plex Mono",monospace; font-size:11.5px; color:var(--ink-3); white-space:nowrap; width:1%}
+.ftable code{background:var(--surface-2); padding:1px 4px; border-radius:3px; border:1px solid var(--rule)}
+.callout{
+  border:1px solid color-mix(in srgb,var(--warn) 38%,transparent); border-inline-start:3px solid var(--warn);
+  background:var(--warn-soft); border-radius:9px; padding:15px 18px; margin-bottom:22px;
+}
+.callout h3{font-size:15px; font-weight:700; color:var(--warn); margin-bottom:7px}
+.callout p{font-size:13.5px; color:var(--ink)}
+.callout p + p{margin-top:8px}
+
+/* ── footer ───────────────────────────────────────────── */
+footer{border-top:1px solid var(--rule); margin-top:44px; padding-top:22px; font-size:13px; color:var(--ink-3)}
+footer b{color:var(--ink-2); font-weight:600}
+.toast{
+  position:fixed; left:50%; bottom:26px; transform:translate(-50%,14px); z-index:50;
+  background:var(--ink); color:var(--ground); font-family:"IBM Plex Mono",monospace; font-size:12.5px;
+  padding:8px 15px; border-radius:7px; opacity:0; pointer-events:none; transition:opacity .2s, transform .2s;
+}
+.toast.on{opacity:1; transform:translate(-50%,0)}
+
+@media (max-width:560px){
+  .row{grid-template-columns:26px 1fr; padding-inline:14px}
+  .dupe{grid-column:2; justify-self:start; margin-top:2px}
+  .quad-head{flex-wrap:wrap}
+  .quad-head .goal{margin-inline-start:0; text-align:left; width:100%}
+  .ftable td:first-child{width:auto}
+  .ftable td:last-child{white-space:normal}
+  .hero{padding-block:36px 26px}
+}
+</style>
+
+<div class="bar">
+  <div class="bar-in">
+    <span class="bar-mark">精读进度</span>
+    <div class="meter"><i id="meter"></i></div>
+    <span class="bar-count" id="count">0 / 24</span>
+    <label class="tgl"><input type="checkbox" id="hideDone"> 隐藏已完成</label>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <header class="hero">
+    <div class="eyebrow">入门 / 进阶 × 架构 / 模型结构</div>
+    <h1>Transformers 精读地图</h1>
+    <p class="lede">
+      24 篇源码精读，把 <code>transformers</code> 这个库拆成两条线：
+      <b>架构</b>讲库怎么把模型跑起来（配置、权重加载、mask、cache、并行），
+      <b>模型结构</b>讲主流模型长什么样（从 Llama 骨架一路到 GLM-5.3）。
+      每一篇的每个断言都带真实行号，文末附可复现的验证命令。
+    </p>
+    <div class="stats">
+      <div class="stat"><b>24</b><span>篇文档</span></div>
+      <div class="stat"><b>28,401</b><span>行（含 TL;DR）</span></div>
+      <div class="stat"><b>4</b><span>象限</span></div>
+      <div class="stat"><b>29</b><span>条流传甚广的说法被实测推翻</span></div>
+    </div>
+  </header>
+
+  <!-- 阅读路径 -->
+  <section id="paths">
+    <div class="sec-head">
+      <h2>先走哪条路</h2>
+      <span class="note">点任一编号跳到对应条目</span>
+    </div>
+    <div class="paths">
+
+      <div class="path">
+        <h3>最短主线</h3>
+        <p class="sub">想快速建立直觉 · 8 篇</p>
+        <div class="chain" data-chain="1A1 1A2 1A3 1M1 1M2 1M3 2M2 2M7"></div>
+        <p class="why">从「模型怎么被造出来」切入，跳过训练与生成循环，直接到 GLM 收口。</p>
+      </div>
+
+      <div class="path">
+        <h3>完整系统</h3>
+        <p class="sub">按 2×2 逐象限推进 · 全 24 篇</p>
+        <div class="chain" data-chain="1A1 1A2 1A3 1M1 1M2 1M3 1M4 1M5 2A5 1A4 1A5 1A6 2A1 2A2 2A3 2A4 2A6 2M1 2M2 2M3 2M4 2M5 2M6 2M7"></div>
+        <p class="why"><code>2A5</code> 特意插在中间——它决定你后面读源码的方式（读 modular 而不是生成文件）。</p>
+      </div>
+
+      <div class="path">
+        <h3>直奔 GLM</h3>
+        <p class="sub">目标是读懂某个具体大模型 · 6 篇</p>
+        <div class="chain" data-chain="1M1 2M2 2A3 2A1 2A2 2M7"></div>
+        <p class="why">打地基 → MLA + MoE 概念 → cache 怎么被压缩 → 稀疏注意力需要的后端与 mask → GLM。</p>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- 2×2 矩阵 -->
+  <section id="map">
+    <div class="sec-head">
+      <h2>2×2 矩阵</h2>
+      <span class="note">勾选记录进度 · 点文件名复制</span>
+    </div>
+
+    <div class="quad q1a">
+      <div class="quad-head">
+        <span class="qid">1A</span>
+        <h3>架构 · 入门</h3>
+        <span class="goal">一次 forward / generate / train 走过哪些文件</span>
+      </div>
+      <div class="rows" data-quad="1A"></div>
+    </div>
+
+    <div class="quad q1m">
+      <div class="quad-head">
+        <span class="qid">1M</span>
+        <h3>模型结构 · 入门</h3>
+        <span class="goal">吃透 decoder-only 骨架，再拿 encoder 对照</span>
+      </div>
+      <div class="rows" data-quad="1M"></div>
+    </div>
+
+    <div class="quad q2a">
+      <div class="quad-head">
+        <span class="qid">2A</span>
+        <h3>架构 · 进阶</h3>
+        <span class="goal">库为这些模型造了哪些抽象层</span>
+      </div>
+      <div class="rows" data-quad="2A"></div>
+    </div>
+
+    <div class="quad q2m">
+      <div class="quad-head">
+        <span class="qid">2M</span>
+        <h3>模型结构 · 进阶</h3>
+        <span class="goal">每个模型对应一类独立的创新</span>
+      </div>
+      <div class="rows" data-quad="2M"></div>
+    </div>
+  </section>
+
+  <!-- 被推翻项 -->
+  <section id="findings">
+    <div class="sec-head">
+      <h2>29 条被实测推翻的说法</h2>
+      <span class="note">遇到和记忆冲突时，以这里为准</span>
+    </div>
+
+    <div class="callout">
+      <h3>⚠️ 其中一条会改变推理结果</h3>
+      <p><b>Gemma 2 的 <code>attn_logit_softcapping</code> 在默认后端下被静默丢弃。</b>
+      它只在 <code>eager</code> / <code>flash_attention_2</code> / <code>flex_attention</code> 下真正执行；
+      而 HF 的默认后端是 <code>sdpa</code>，<code>sdpa_attention_forward</code> 的签名只有 <code>**kwargs</code>，
+      soft-cap 被吞掉——不报错、不警告。</p>
+      <p>也就是说，<b>直接加载一个 Gemma 2 推理，拿到的是没有 soft-cap 的模型</b>，数值上与官方实现不一致。
+      要复现官方行为需显式指定 <code>attn_implementation="eager"</code>（或 flash）。
+      （<code>final_logit_softcapping</code> 不受影响，它作用在 lm_head 输出上。）</p>
+    </div>
+
+    <div class="fgroup">
+      <h3><span class="tag">已经不存在了</span> 删除与改名 <span class="cnt">8 条</span></h3>
+      <table class="ftable">
+        <thead><tr><th>流传的说法</th><th>实测真相</th><th>出处</th></tr></thead>
+        <tbody>
+          <tr><td><code>_attn_implementation_autoset</code> 会按硬件自动挑后端</td><td>已从库中移除。只剩「默认 <code>sdpa</code>，不可用则静默降级 <code>eager</code>」</td><td>2A1</td></tr>
+          <tr><td><code>cache_position</code> / <code>cache_kwargs</code></td><td>已删除。源码原话：<b>"This arg has been removed from the Transformers library"</b></td><td>2A3、1A5</td></tr>
+          <tr><td><code>LogitsWarper</code> 基类</td><td>不存在。warper 直接继承 <code>LogitsProcessor</code></td><td>1A5</td></tr>
+          <tr><td><code>MixtralBlockSparseTop2MLP</code></td><td>已删除，现名 <code>MixtralExperts</code>（<code>nn.Module</code> + 3D 张量，不是 <code>ModuleList</code>）</td><td>1M3</td></tr>
+          <tr><td>tokenizer 有 <code>PreTrainedTokenizer</code> / <code>PreTrainedTokenizerFast</code> 两个类</td><td>都降级成<b>别名</b>。真实类是三个 backend；<code>AutoTokenizer(use_fast=)</code> 被静默吞掉</td><td>1A4</td></tr>
+          <tr><td><code>config.rope_scaling</code></td><td>已改名 <code>rope_parameters</code>，<code>rope_scaling</code> 只剩 <code>property</code> 别名</td><td>1A2、2A4</td></tr>
+          <tr><td><code>rope_config_validation</code> 负责 RoPE 校验</td><td>已废弃，<b>全库零调用者</b>。校验搬到了 <code>RotaryEmbeddingConfigMixin.validate_rope</code></td><td>2A4</td></tr>
+          <tr><td>Mamba2 有 <code>is_mambapy</code> 慢速回退开关</td><td>没有。Mamba2 把它整个移交给了 kernel 分发；该开关只在 Mamba1 里</td><td>2M5</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="fgroup">
+      <h3><span class="tag">位置指错了</span> 东西在别的文件里 <span class="cnt">6 条</span></h3>
+      <table class="ftable">
+        <thead><tr><th>流传的说法</th><th>实测真相</th><th>出处</th></tr></thead>
+        <tbody>
+          <tr><td>张量并行在 <code>integrations/tensor_parallel.py</code></td><td>那只是 93 行的兼容 shim。本体在 <code>distributed/tensor_parallel.py</code>（843 行）</td><td>2A6</td></tr>
+          <tr><td><code>integrations/moe.py</code> 是专家分片逻辑</td><td>它是 experts forward 的<b>内核分派</b>（deepgemm / grouped_mm / batched_mm / sonicmoe）</td><td>2A6</td></tr>
+          <tr><td><code>@strict</code> 是本库的装饰器</td><td>来自 <code>huggingface_hub.dataclasses</code>，不是本库</td><td>1A2</td></tr>
+          <tr><td><code>ROPE_INIT_FUNCTIONS</code> 里有 <code>"default"</code></td><td>只有 6 个 key，<b>没有 <code>default</code></b>——它由各模型自带的静态方法兜底</td><td>2A4</td></tr>
+          <tr><td>注意力注册表含 <code>"eager"</code></td><td>只有 10 个 key，<b>没有 <code>eager</code></b>——它是 <code>get_interface</code> 的默认回退值</td><td>2A1</td></tr>
+          <tr><td>llama / mistral 有自己的 <code>prepare_inputs_for_generation</code></td><td>已上提到 <code>GenerationMixin</code>（<code>generation/utils.py:519</code>）</td><td>1A5</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="fgroup">
+      <h3><span class="tag">语义反了</span> 方向或含义搞错 <span class="cnt">6 条</span></h3>
+      <table class="ftable">
+        <thead><tr><th>流传的说法</th><th>实测真相</th><th>出处</th></tr></thead>
+        <tbody>
+          <tr><td>T5 是 Post-Norm</td><td>实测是 <b>Pre-Norm</b>——norm 藏在各子层内部，<code>T5Block.forward</code> 里一个 norm 都没有，所以「看起来像 post-norm」</td><td>2M4</td></tr>
+          <tr><td>T5 对 input embedding 做了缩放</td><td>没有。<code>model_dim**-0.5</code> 只用在 <b>decoder 输出</b>侧</td><td>2M4</td></tr>
+          <tr><td><code>fusion_mapping.py</code> 把 fused 层拆开</td><td><b>方向相反</b>：它把运行时模型改成 fused，再注册映射让原始 checkpoint 仍能加载</td><td>2A6</td></tr>
+          <tr><td>专家并行用 all-to-all 通信</td><td><code>all_to_all</code> 全库<b>零命中</b>。是 all-reduce 合成输出</td><td>2A6</td></tr>
+          <tr><td>ModernBERT 的滑动窗口与 Mistral 同向</td><td>它是<b>双向 band</b>（<code>abs(q_idx - kv_idx) &lt;= w</code>）；Mistral 是因果的（只看左边）。encoder 里「不能看未来」不成立</td><td>1M5</td></tr>
+          <tr><td><code>_LazyAutoMapping</code> 靠 <code>__getattr__</code> 做惰性导入</td><td>它<b>没有</b> <code>__getattr__</code>。惰性来自 <code>_load_attr_from_module</code> 里的 <code>importlib.import_module</code></td><td>1A1</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="fgroup">
+      <h3><span class="tag">静默行为</span> 不报错，但结果不同 <span class="cnt">5 条</span></h3>
+      <table class="ftable">
+        <thead><tr><th>流传的说法</th><th>实测真相</th><th>出处</th></tr></thead>
+        <tbody>
+          <tr><td>Gemma 2 的 soft-cap 总生效</td><td>默认 <code>sdpa</code> 后端<b>静默丢弃</b>（<code>grep -c softcap integrations/sdpa_attention.py</code> → 0）</td><td>2M1</td></tr>
+          <tr><td>三家 MoE 都有负载均衡辅助损失</td><td>DeepSeek V2/V3 <b>没有</b>，靠 <code>e_score_correction_bias</code> 做无辅助损失均衡</td><td>2M3</td></tr>
+          <tr><td>BERT 的 MLM loss 只对被 mask 的位置算</td><td>模型算<b>全序列</b> cross-entropy；位置筛选在数据侧（collator 把其余位置填 <code>-100</code>）</td><td>1M5</td></tr>
+          <tr><td>映射表用 <code>None</code> 表示「不支持该任务头」</td><td>模型映射表里 <code>None</code> 出现 <b>0 次</b>。<code>None</code> 只在 tokenizer / processor 映射里表示「可选依赖没装」</td><td>1A1</td></tr>
+          <tr><td>LLaVA-NeXT 屏蔽 image token 的 loss</td><td>模型内<b>没有</b>这个屏蔽，图像位置默认要算 loss</td><td>2M6</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="fgroup">
+      <h3><span class="tag">数字与结构</span> 记错了个数和层级 <span class="cnt">4 条</span></h3>
+      <table class="ftable">
+        <thead><tr><th>流传的说法</th><th>实测真相</th><th>出处</th></tr></thead>
+        <tbody>
+          <tr><td><code>TrainingArguments</code> 约有 200 个字段</td><td><b>112</b> 个 <code>field()</code></td><td>1A6</td></tr>
+          <tr><td><code>Trainer</code> 自己做混合精度 autocast</td><td><code>autocast_smart_context_manager</code> 是<b>空壳</b>，直接 <code>return contextlib.nullcontext()</code>；实际由 accelerate 接管</td><td>1A6</td></tr>
+          <tr><td>GLM 的 DecoderLayer 直接继承 Llama</td><td><b>5 层继承链</b>：<code>Llama → DeepseekV3 → Glm4Moe → Glm4MoeLite → DeepseekV32 → GlmMoeDsa</code></td><td>2M7</td></tr>
+          <tr><td>Gemma 2 的层类型按 <code>layer_idx % 2</code> 判断</td><td>由 <code>__post_init__</code> 预计算的 <code>config.layer_types</code> 查表（第 0 层是局部层）</td><td>2M1</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+  </section>
+
+  <footer>
+    <p><b>怎么用这份地图：</b>每篇文档都带「速读区（TL;DR）」——复习时看前 50 行即可，
+    需要证据时再往下翻到「验证清单」，里面是实际跑过的 <code>grep</code> / <code>sed</code> 命令与原样输出。</p>
+    <p style="margin-top:9px"><b>进度记在本机浏览器里</b>（localStorage），换浏览器或清站点数据会丢；
+    这个页面本身不保存任何东西。</p>
+    <p style="margin-top:9px">文件名可点击复制，粘到编辑器或终端即可打开对应文档。</p>
+  </footer>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(function(){
+  "use strict";
+
+  // ── 文档数据 ──────────────────────────────────────────
+  var DOCS = {
+    "1A": [
+      ["1A1","仓库骨架与 auto 机制","模型目录五件套；<code>AutoModel</code> 从 config 找到类的三层跳转，以及惰性导入的真实落点。","1A1_repo_and_auto.md"],
+      ["1A2","配置系统","<code>config.json</code> ↔ 实例：v5 dataclass 化、<code>@strict</code> 校验、<code>sub_configs</code> 组合式配置。","1A2_config_system.md"],
+      ["1A3","from_pretrained 全链路","下载 → 建模 → 灌权重；missing / unexpected / mismatched 三类 key 的归属与排查。","1A3_from_pretrained.md"],
+      ["1A4","Tokenizer 体系","v5 的三个 backend；<code>__call__</code> 里的 padding / truncation / special tokens 与 chat_template。","1A4_tokenizer.md"],
+      ["1A5","generate 主循环","prefill vs decode 的代码分界；logits 流水线；停止条件与流式输出。","1A5_generate_loop.md"],
+      ["1A6","Trainer 主循环","三层循环（epoch / update_step / micro-batch）；梯度累积的两条路径；回调钩子。","1A6_trainer.md"]
+    ],
+    "1M": [
+      ["1M1","Llama","Decoder-only 骨架的七块积木：RMSNorm / RoPE / SwiGLU / GQA / Pre-Norm 残差。整条线的地基。","1M1_llama_structure.md"],
+      ["1M2","Mistral","滑动窗口注意力；以及 SWA 的 cache 裁剪到底由谁执行的完整链路。","1M2_mistral_sliding_window.md"],
+      ["1M3","Mixtral","MoE 第一课：稀疏激活、router、top-k gating。也是「MoE 家族的 Llama」。","1M3_mixtral_moe.md"],
+      ["1M4","Qwen3（dense）","QK-Norm 的位置、<code>head_dim</code> 与 <code>hidden_size</code> 解耦、RoPE 参数统一进 <code>rope_parameters</code>。","1M4_qwen3_dense.md"],
+      ["1M5","BERT / ModernBERT","Encoder 对照面：双向注意力、MLM、<code>[CLS]</code>，以及 ModernBERT 的现代化改造清单。","1M5_bert_modernbert.md"]
+    ],
+    "2A": [
+      ["2A1","注意力后端机制","<code>ALL_ATTENTION_FUNCTIONS</code> 注册表与分发；eager / sdpa / flash / flex 的差异与代价。","2A1_attention_backends.md"],
+      ["2A2","Mask 系统","<code>mask_function</code> 的组合代数；causal / sliding-window / padding 如何拼成一张 mask。","2A2_masking_system.md"],
+      ["2A3","KV Cache 体系","Layer / Cache 双层架构、23 个类的家族树、显存算例与连续批处理的平行体系。","2A3_kv_cache.md"],
+      ["2A4","RoPE 抽象层","6 个 init 函数；llama3 按波长分三段；两种 <code>rotate_half</code> 数学等价但权重不通用。","2A4_rope_abstraction.md"],
+      ["2A5","代码生成机制","<code>modular_*.py</code> 如何生成 <code>modeling_*.py</code>；为什么不能直接改生成文件。","2A5_modular_code_generation.md"],
+      ["2A6","权重 / 量化 / 并行","跨实现权重映射；26 个量化 key；19 种张量并行策略与专家并行。","2A6_weights_quant_parallel.md"]
+    ],
+    "2M": [
+      ["2M1","Gemma 2","软上限注意力（注意：默认后端下不生效）、交替局部 / 全局、<code>query_pre_attn_scalar</code>。","2M1_gemma2.md"],
+      ["2M2","DeepSeek V2 → V3","MLA 低秩 KV 压缩；DeepSeekMoE 细粒度路由 + 共享专家；三个版本的 cache 对照。","2M2_deepseek_mla_moe.md"],
+      ["2M3","Qwen3-MoE","三家 MoE 横向对比（Mixtral / DeepSeek / Qwen3-MoE）；通用组件抽取与继承树。","2M3_qwen3_moe.md"],
+      ["2M4","T5","Encoder-Decoder：相对位置分桶、一个类三种角色、<code>EncoderDecoderCache</code>。","2M4_t5_encoder_decoder.md"],
+      ["2M5","Mamba 2","SSM：用固定大小的状态替代无限增长的 KV cache，代价是召回精度。","2M5_mamba2_ssm.md"],
+      ["2M6","LLaVA-NeXT","多模态：视觉编码器 + 语言模型的拼接与投影、<code>masked_scatter</code> 替换、AnyRes。","2M6_llava_next_multimodal.md"],
+      ["2M7","GLM-5.3","压轴：MLA + DSA 稀疏 top-k + IndexShare 跨层复用。整条线的终点。","2M7_glm_moe_dsa.md"]
+    ]
+  };
+
+  var KEY = "tf-reading-progress-v1";
+  var done = {};
+
+  try {
+    var raw = localStorage.getItem(KEY);
+    if (raw) done = JSON.parse(raw) || {};
+  } catch (e) { done = {}; }
+
+  function save(){
+    try { localStorage.setItem(KEY, JSON.stringify(done)); } catch (e) {}
+  }
+
+  // ── 构建矩阵 ──────────────────────────────────────────
+  Object.keys(DOCS).forEach(function(quad){
+    var host = document.querySelector('.rows[data-quad="' + quad + '"]');
+    if (!host) return;
+    var html = DOCS[quad].map(function(d){
+      var id = d[0];
+      return '<div class="row" id="doc-' + id + '">' +
+               '<input type="checkbox" data-id="' + id + '" aria-label="标记 ' + id + ' 已读完">' +
+               '<div class="row-body">' +
+                 '<div class="row-title">' +
+                   '<span class="num">' + id + '</span>' +
+                   '<strong>' + d[1] + '</strong>' +
+                   '<span class="status"></span>' +
+                 '</div>' +
+                 '<div class="row-desc">' + d[2] + '</div>' +
+               '</div>' +
+               '<button class="dupe" type="button" data-path="' + d[3] + '" title="复制文件名">' + d[3] + '</button>' +
+             '</div>';
+    }).join("");
+    host.innerHTML = html;
+  });
+
+  // ── 进度 ──────────────────────────────────────────────
+  var boxes = Array.prototype.slice.call(document.querySelectorAll('.row input[type=checkbox]'));
+  var meter = document.getElementById("meter");
+  var countEl = document.getElementById("count");
+
+  function syncDocs(){
+    boxes.forEach(function(b){
+      var id = b.dataset.id;
+      var row = document.getElementById("doc-" + id);
+      var on = !!done[id];
+      b.checked = on;
+      row.classList.toggle("done", on);
+      var st = row.querySelector(".status");
+      st.textContent = on ? "已读完" : "";
+    });
+    var n = Object.keys(done).filter(function(k){ return done[k]; }).length;
+    meter.style.width = (n / boxes.length * 100) + "%";
+    countEl.textContent = n + " / " + boxes.length;
+
+    // 路径 chip 同步
+    document.querySelectorAll(".chain").forEach(function(chain){
+      chain.querySelectorAll(".chip").forEach(function(chip){
+        chip.classList.toggle("done", !!done[chip.dataset.id]);
+      });
+    });
+  }
+
+  boxes.forEach(function(b){
+    b.addEventListener("change", function(){
+      done[b.dataset.id] = b.checked;
+      if (!b.checked) delete done[b.dataset.id];
+      save(); syncDocs();
+    });
+  });
+
+  // ── 阅读路径 chip ─────────────────────────────────────
+  document.querySelectorAll(".chain").forEach(function(chain){
+    var ids = (chain.dataset.chain || "").split(/\s+/).filter(Boolean);
+    chain.innerHTML = ids.map(function(id, i){
+      return (i ? '<span class="arrow" aria-hidden="true">→</span>' : "") +
+             '<button class="chip" type="button" data-id="' + id + '">' + id + '</button>';
+    }).join("");
+    chain.addEventListener("click", function(ev){
+      var chip = ev.target.closest(".chip");
+      if (!chip) return;
+      var row = document.getElementById("doc-" + chip.dataset.id);
+      if (!row) return;
+      document.body.classList.remove("hide-done");
+      document.getElementById("hideDone").checked = false;
+      row.scrollIntoView({behavior: "smooth", block: "center"});
+      row.classList.remove("hit");
+      void row.offsetWidth;
+      row.classList.add("hit");
+    });
+  });
+
+  // ── 隐藏已完成 ────────────────────────────────────────
+  var hide = document.getElementById("hideDone");
+  hide.addEventListener("change", function(){
+    document.body.classList.toggle("hide-done", hide.checked);
+  });
+
+  // ── 复制文件名 ────────────────────────────────────────
+  var toast = document.getElementById("toast");
+  var toastTimer = null;
+  function say(msg){
+    toast.textContent = msg;
+    toast.classList.add("on");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function(){ toast.classList.remove("on"); }, 1600);
+  }
+
+  function copyText(text){
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text);
+    }
+    return Promise.reject(new Error("no clipboard api"));
+  }
+
+  document.addEventListener("click", function(ev){
+    var btn = ev.target.closest(".dupe");
+    if (!btn) return;
+    var path = btn.dataset.path;
+    copyText(path).then(function(){
+      say("已复制 " + path);
+    }).catch(function(){
+      // 兜底：选中文字让用户手动复制
+      var range = document.createRange();
+      range.selectNodeContents(btn);
+      var sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      say("请按 ⌘C 复制");
+    });
+  });
+
+  syncDocs();
+})();
+</script>
