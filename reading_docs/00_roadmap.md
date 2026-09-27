@@ -3,6 +3,23 @@
 > 目标：系统学习 `transformers` 这个库。
 > 两条线并行：**架构**（库自身的机制与源码调用链——「原理」）与**模型结构**（主流模型长什么样——「模型」）。
 > 每条线分两级：**入门**先把骨架摸清，**进阶**再啃稀疏/压缩/多模态这些真难点。
+>
+> **24 篇全部完成**（28,401 行）。随手可用的两个入口：
+> - **[index.html](./index.html)** —— 交互式学习地图：阅读路径 + 进度追踪 + 速查表
+> - **[附录 · 29 条被实测推翻的说法](#附录--29-条被实测推翻的说法)** —— 读之前先扫一眼，能省很多困惑
+
+---
+
+## 读之前：这套文档的一个前提
+
+写这 24 篇的过程中，**有 29 条流传很广的说法被实测推翻了**（`cache_position` 已删除、
+T5 不是 Post-Norm、张量并行不在 `integrations/`……）。
+其中一条甚至会**改变推理结果**——Gemma 2 的 soft-cap 在默认 `sdpa` 后端下被静默丢弃。
+
+所以：**这套文档的每个断言都带真实行号，文末都有「验证清单」列出实际跑过的命令。**
+遇到和记忆冲突的地方，以验证清单为准，不要以直觉为准。
+
+完整清单见文末[附录](#附录--29-条被实测推翻的说法)。
 
 ---
 
@@ -98,48 +115,10 @@
 看到自动拉取的类不要当成新东西）。
 2A1 / 2A2 / 2A3 是「注意力三件套」，本质是同一件事的三个侧面：**算什么（后端）、在哪算（mask）、缓存什么（cache）**。建议连着读。
 
-> **⚠️ 一个提醒**：这 6 篇里有多处「流传很广但已经过时」的说法被实测推翻了。
-> 每篇的验证清单里都写了实测命令，**遇到和记忆冲突的地方，以验证清单为准**。已知的被推翻项：
-> - `_attn_implementation_autoset` 已从库中移除（2A1）
-> - 注册表里没有 `"eager"`，它是回退默认值（2A1）
-> - `cache_position` / `cache_kwargs` 已被删除（2A3、1A5 独立确认）
-> - `MixtralBlockSparseTop2MLP` 已不存在，现名 `MixtralExperts`（1M3）
-> - `TrainingArguments` 是 112 个字段，不是 200（1A6）
-> - `Trainer.autocast_smart_context_manager` 是空壳（1A6）
-> - `LogitsWarper` 基类不存在（1A5）
-> - `_LazyAutoMapping` 没有 `__getattr__`；模型映射表里没有 `None`（1A1）
-> - tokenizer 的 fast / slow 双类已取消，旧类名降级为别名（1A4）
-> - 张量并行本体在 `distributed/`，`integrations/tensor_parallel.py` 只是 shim（2A6）
-> - **T5 是 Pre-Norm，不是 Post-Norm**（2M4）——norm 藏在各子层内部（`T5LayerSelfAttention` /
->   `T5LayerFF`），`T5Block.forward` 里一个 norm 都没有，所以「看起来像 post-norm」。
->   真正的 Post-Norm 是 BERT（`modeling_bert.py:292`/`:350`），与 1M5 一致
-> - **T5 没有 embedding scaling**（2M4）——`model_dim**-0.5` 只用在 **decoder 输出**
->   （`modeling_t5.py:1045`，由 `scale_decoder_outputs` 控制），不是 embed 层
-> - **`@strict` 来自 `huggingface_hub.dataclasses`**，不是本库；它是**类型校验**而非拒绝未知字段（1A2）
-> - **Gemma 2 的 soft-cap 在默认后端下被静默丢弃**（2M1）⚠️ 见下方单独的警告块
-> - `ROPE_INIT_FUNCTIONS` 只有 6 个 key，**没有 `"default"`**（2A4）；
->   `rope_config_validation` 已废弃、**零调用者**（2A4）
-
-> ## ⚠️ 一个值得注意的实测发现：Gemma 2 的 soft-cap 默认不生效
->
-> `attn_logit_softcapping=50.0` 是 Gemma 2 的核心设计之一，但**它只在 `eager` 和
-> `flash_attention_2` 后端下真正执行**：
->
-> | 后端 | 是否应用 soft-cap | 证据 |
-> |------|------------------|------|
-> | `eager` | ✅ | Gemma2 自带 `eager_attention_forward` 里三行 `x/c → tanh → *c`（`modular_gemma2.py:202-205`） |
-> | `sdpa`（**默认**） | ❌ **静默丢弃，无警告** | `grep -c softcap integrations/sdpa_attention.py` → **0**；签名只有 `**kwargs` 吞掉 |
-> | `flash_attention_2` | ✅ 运行时探测 | `modeling_flash_attention_utils.py:226-245` 用 `inspect.signature` 判断 |
-> | `flex_attention` | ✅ | 在 `score_mod` 里做（`integrations/flex_attention.py:291-292`） |
-> | 三个 `*_paged` | ❌ | — |
->
-> 而 HF 的默认后端就是 sdpa（`modeling_utils.py:1927`）。
-> **所以「加载一个 Gemma 2 直接推理」拿到的是没有 soft-cap 的模型**——
-> 数值上与官方实现不一致，却不报错、不警告。
-> 要复现官方行为需显式 `attn_implementation="eager"`（或 flash）。
->
-> 这条是 2M1 精读时发现的，**尚未确认是否为有意设计**（可能上游认为 soft-cap 可省）。
-> 读到 2M1 时注意它的验证清单里有完整证据。
+> **⚠️ 读之前先看一眼**：这套文档涉及的大量「流传很广的说法」**已经在 v5 里失效了**。
+> 完整的 **29 条清单**见文末 [附录 · 29 条被实测推翻的说法](#附录--29-条被实测推翻的说法)。
+> 其中一条会**改变推理结果**（Gemma 2 的 soft-cap），在附录里单独高亮。
+> 遇到和记忆冲突的地方，以各篇的「验证清单」为准——那些命令都是实际跑过的。
 
 ## 2M · 模型结构进阶
 
@@ -208,16 +187,45 @@
 
 ---
 
-## 现有文件对照
+## 全部文件索引
 
-| 文件名 | 所属 | 状态 |
-|--------|------|------|
-| `1M1_llama_structure.md` | 入门 · 模型结构 | ✅（原 `01_llama_structure.md`） |
-| `1M2_mistral_sliding_window.md` | 入门 · 模型结构 | ✅（原 `02_mistral_sliding_window.md`） |
-| `2A5_modular_code_generation.md` | 进阶 · 架构 | ✅ |
+24 篇全部完成。**22 篇长文都带「速读区（TL;DR）」**——复习时只看前 50 行即可；
+`1M1` / `1M2` 不足 300 行，不需要速读区。24 篇都有「验证清单」。
 
+| 篇 | 文件 | 行数 | 速读区 |
+|----|------|------|--------|
+| 1A1 | `1A1_repo_and_auto.md` | 1242 | ✅ |
+| 1A2 | `1A2_config_system.md` | 1018 | ✅ |
+| 1A3 | `1A3_from_pretrained.md` | 2019 | ✅ |
+| 1A4 | `1A4_tokenizer.md` | 1396 | ✅ |
+| 1A5 | `1A5_generate_loop.md` | 1390 | ✅ |
+| 1A6 | `1A6_trainer.md` | 1185 | ✅ |
+| 1M1 | `1M1_llama_structure.md` | 252 | — |
+| 1M2 | `1M2_mistral_sliding_window.md` | 265 | — |
+| 1M3 | `1M3_mixtral_moe.md` | 1091 | ✅ |
+| 1M4 | `1M4_qwen3_dense.md` | 716 | ✅ |
+| 1M5 | `1M5_bert_modernbert.md` | 1275 | ✅ |
+| 2A1 | `2A1_attention_backends.md` | 1552 | ✅ |
+| 2A2 | `2A2_masking_system.md` | 1851 | ✅ |
+| 2A3 | `2A3_kv_cache.md` | 1431 | ✅ |
+| 2A4 | `2A4_rope_abstraction.md` | 1596 | ✅ |
+| 2A5 | `2A5_modular_code_generation.md` | 642 | ✅ |
+| 2A6 | `2A6_weights_quant_parallel.md` | 1389 | ✅ |
+| 2M1 | `2M1_gemma2.md` | 1073 | ✅ |
+| 2M2 | `2M2_deepseek_mla_moe.md` | 1392 | ✅ |
+| 2M3 | `2M3_qwen3_moe.md` | 1270 | ✅ |
+| 2M4 | `2M4_t5_encoder_decoder.md` | 1325 | ✅ |
+| 2M5 | `2M5_mamba2_ssm.md` | 1100 | ✅ |
+| 2M6 | `2M6_llava_next_multimodal.md` | 1238 | ✅ |
+| 2M7 | `2M7_glm_moe_dsa.md` | 693 | ✅ |
+| | **合计** | **28,401** | 22 / 24 |
+
+> **`index.html`** 是同目录下的学习地图：3 条阅读路径、可勾选的进度追踪、以及下面的 29 条清单。
+> 浏览器直接打开即可（进度存在浏览器本地）。
+
+> **历史沿革**：最早的 `01_llama_structure.md` / `02_mistral_sliding_window.md`
+> 已重命名为 `1M1` / `1M2`，纳入本矩阵。
 > 文档之间用相对链接互引（如 `[1M1](./1M1_llama_structure.md)`）。
-> 新增文档时记得回填「上一篇 / 下一篇」导航。
 
 ---
 
@@ -234,3 +242,98 @@
 
 > 生成文件**不要直接编辑**——改动会被 `make fix-repo` 覆盖。
 > 完整机制见 [2A5_modular_code_generation.md](./2A5_modular_code_generation.md)。
+
+---
+
+# 附录 · 29 条被实测推翻的说法
+
+这套文档在写作过程中逐个实测源码，**有 29 条流传很广的说法被推翻**。
+它们散落在各篇的正文和「验证清单」里，这里汇总成一张速查表。
+
+**遇到和记忆冲突的地方，以这里和验证清单为准。** 每条都标了在哪一篇、以及判据。
+
+> ## ⚠️ 其中一条会改变推理结果
+>
+> **Gemma 2 的 `attn_logit_softcapping` 在默认后端下被静默丢弃。**
+> 它只在 `eager` / `flash_attention_2` / `flex_attention` 下真正执行：
+>
+> | 后端 | 是否应用 soft-cap | 证据 |
+> |------|------------------|------|
+> | `eager` | ✅ | Gemma2 自带 `eager_attention_forward` 里三行 `x/c → tanh → *c`（`modular_gemma2.py:202-205`） |
+> | `sdpa`（**默认**） | ❌ **静默丢弃，无警告** | `grep -c softcap integrations/sdpa_attention.py` → **0**；签名只有 `**kwargs` 吞掉 |
+> | `flash_attention_2` | ✅ 运行时探测 | `modeling_flash_attention_utils.py:226-245` 用 `inspect.signature` 判断 |
+> | `flex_attention` | ✅ | 在 `score_mod` 里做（`integrations/flex_attention.py:291-292`） |
+> | 三个 `*_paged` | ❌ | — |
+>
+> 而 HF 的默认后端就是 sdpa（`modeling_utils.py:1927`）。
+> **所以「加载一个 Gemma 2 直接推理」拿到的是没有 soft-cap 的模型**——
+> 数值上与官方实现不一致，却不报错、不警告。
+> 要复现官方行为需显式 `attn_implementation="eager"`（或 flash）。
+> `final_logit_softcapping` 不受影响，它作用在 lm_head 输出上。
+>
+> 这条是 2M1 精读时发现的，**尚未确认是否为有意设计**（可能上游认为 soft-cap 可省）。
+> 完整证据见 [2M1](./2M1_gemma2.md) 的验证清单。
+
+## 一、已经不存在了（删除与改名）— 8 条
+
+| 流传的说法 | 实测真相 | 篇 |
+|-----------|---------|-----|
+| `_attn_implementation_autoset` 会按硬件自动挑后端 | 已从库中移除。只剩「默认 `sdpa`，不可用则静默降级 `eager`」（`modeling_utils.py:1927` / `:1953-1960`）。唯一的自动升级在连续批处理里 | 2A1 |
+| `cache_position` / `cache_kwargs` | **已删除**。源码原话：*"This arg has been removed from the Transformers library"*（`generation/utils.py:628`），只剩给 remote code 的兼容 shim | 2A3、1A5 |
+| `LogitsWarper` 基类 | 不存在。warper 直接继承 `LogitsProcessor`（`logits_process.py:238` / `:473` / `:542`） | 1A5 |
+| `MixtralBlockSparseTop2MLP` | 已删除，现名 **`MixtralExperts`**（`nn.Module` + 3D 张量，不是 `ModuleList`） | 1M3 |
+| tokenizer 有 `PreTrainedTokenizer` / `PreTrainedTokenizerFast` 两个类 | 都降级成**别名**（`tokenization_python.py:1424` / `tokenization_utils_tokenizers.py:1478`）。真实类是 `TokenizersBackend` / `PythonBackend` / `SentencePieceBackend`；`AutoTokenizer(use_fast=)` 被静默吞掉 | 1A4 |
+| `config.rope_scaling` | 已改名 **`rope_parameters`**，`rope_scaling` 只剩 `property` 别名（`configuration_utils.py:548-554`） | 1A2、2A4 |
+| `rope_config_validation` 负责 RoPE 校验 | 已废弃，**全库零调用者**。校验搬到 `RotaryEmbeddingConfigMixin.validate_rope` | 2A4 |
+| Mamba2 有 `is_mambapy` 慢速回退开关 | 没有。Mamba2 把它整个移交给了 kernel 分发；该开关只在 **Mamba1** 里（`configuration_mamba.py:40`） | 2M5 |
+
+## 二、位置指错了（东西在别的文件里）— 6 条
+
+| 流传的说法 | 实测真相 | 篇 |
+|-----------|---------|-----|
+| 张量并行在 `integrations/tensor_parallel.py` | 那只是 93 行的兼容 shim（文件头自称 BC shim）。本体在 **`distributed/tensor_parallel.py`**（843 行） | 2A6 |
+| `integrations/moe.py` 是专家分片逻辑 | 它是 experts forward 的**内核分派**（deepgemm / grouped_mm / batched_mm / sonicmoe）。分片逻辑在 `distributed/` | 2A6 |
+| `@strict` 是本库的装饰器 | 来自 **`huggingface_hub.dataclasses`**（`configuration_utils.py:25`），不是本库 | 1A2 |
+| `ROPE_INIT_FUNCTIONS` 里有 `"default"` | 只有 **6 个 key**，**没有 `default`**——它由各模型自带的 `compute_default_rope_parameters` 静态方法兜底 | 2A4 |
+| 注意力注册表含 `"eager"` | 只有 **10 个 key**，**没有 `eager`**——它是 `get_interface(name, default)` 的回退默认值 | 2A1 |
+| llama / mistral 有自己的 `prepare_inputs_for_generation` | 已上提到 **`GenerationMixin`**（`generation/utils.py:519`）；全库 500+ 模型目录只剩 75 处定义 | 1A5 |
+
+## 三、语义反了（方向或含义搞错）— 6 条
+
+| 流传的说法 | 实测真相 | 篇 |
+|-----------|---------|-----|
+| T5 是 Post-Norm | 实测是 **Pre-Norm**——norm 藏在各子层内部（`modeling_t5.py:392-400` / `:138-140`），`T5Block.forward` 里一个 norm 都没有，所以「看起来像 post-norm」。真正的 Post-Norm 是 BERT（`modeling_bert.py:292` / `:350`） | 2M4 |
+| T5 对 input embedding 做了缩放 | 没有。`model_dim**-0.5` 只用在 **decoder 输出**侧（`modeling_t5.py:1045`，由 `scale_decoder_outputs` 控制） | 2M4 |
+| `fusion_mapping.py` 把 fused 层拆开 | **方向相反**：它把运行时模型改成 fused（Conv3d patch_embed → Linear），再注册映射让原始 checkpoint 仍能加载 | 2A6 |
+| 专家并行用 all-to-all 通信 | `all_to_all` 全库**零命中**。是 **all-reduce** 合成输出（`tensor_parallel.py:320` / `:353`） | 2A6 |
+| ModernBERT 的滑动窗口与 Mistral 同向 | 它是**双向 band**（`abs(q_idx - kv_idx) <= w`，`masking_utils.py:149`）；Mistral 是因果的（只看左边）。encoder 里「不能看未来」不成立 | 1M5 |
+| `_LazyAutoMapping` 靠 `__getattr__` 做惰性导入 | 它**没有** `__getattr__`。惰性来自 `_load_attr_from_module` 里的 `importlib.import_module`（`auto_factory.py:612-616`） | 1A1 |
+
+## 四、静默行为（不报错，但结果不同）— 5 条
+
+| 流传的说法 | 实测真相 | 篇 |
+|-----------|---------|-----|
+| Gemma 2 的 soft-cap 总生效 | 默认 `sdpa` 后端**静默丢弃**（见上方警告块） | 2M1 |
+| 三家 MoE 都有负载均衡辅助损失 | DeepSeek V2/V3 **没有**（`grep -c aux_loss` 两个文件都是 0），靠 `e_score_correction_bias` 做无辅助损失均衡：**选专家看偏置**（`scores + bias` → `topk`，`modular_deepseek_v3.py:99` / `:114`），**算权重不看偏置**（`topk_weights = scores.gather(...)`，`:115`） | 2M3 |
+| BERT 的 MLM loss 只对被 mask 的位置算 | 模型算**全序列** cross-entropy（`modeling_bert.py:972-975` 用裸 `CrossEntropyLoss()`）；位置筛选在数据侧（`data_collator.py:831` 把其余位置填 `-100`） | 1M5 |
+| 映射表用 `None` 表示「不支持该任务头」 | 模型映射表里 `None` 出现 **0 次**。「不支持」= 不在表里 → `ValueError`。`None` 只在 tokenizer / processor 映射里表示「可选依赖没装」 | 1A1 |
+| LLaVA-NeXT 屏蔽 image token 的 loss | 模型内**没有**这个屏蔽，图像位置默认要算 loss，屏蔽由数据侧负责 | 2M6 |
+
+## 五、数字与结构（记错了个数和层级）— 4 条
+
+| 流传的说法 | 实测真相 | 篇 |
+|-----------|---------|-----|
+| `TrainingArguments` 约有 200 个字段 | **112** 个 `field()` | 1A6 |
+| `Trainer` 自己做混合精度 autocast | `autocast_smart_context_manager` 是**空壳**（`trainer.py:2081`），直接 `return contextlib.nullcontext()`；实际由 accelerate 接管 | 1A6 |
+| GLM 的 DecoderLayer 直接继承 Llama | **5 层继承链**：`Llama → DeepseekV3 → Glm4Moe → Glm4MoeLite → DeepseekV32 → GlmMoeDsa`。骨架结论仍成立，但理由是「穿过整条链传下来的」 | 2M7 |
+| Gemma 2 的层类型按 `layer_idx % 2` 判断 | 由 `__post_init__` 预计算的 `config.layer_types` 查表（`(i+1) % 2`，**第 0 层是局部层**） | 2M1 |
+
+---
+
+### 还有两条「不是错，但值得单独记」的实测发现
+
+| 发现 | 出处 |
+|------|------|
+| **MLA 的省显存在 V3.2 / GLM 上被 DSA 抵消了**：cache 从 V3 的 **576 元素/token/层** 涨到 **40960**（涨 71 倍），因为要按 top-k 索引去 select 具体的 K/V 行，压缩潜向量没法直接选。代码自带 `TODO` 承认。这个取舍是 **DeepSeek V3.2 做的，不是 GLM 做的** | 2M2、2M7 |
+| **仓库自己的规则文件和实际不符**：`utils/rules.toml` 的 TRF010 要求 config 用 `@strict(accept_kwargs=True)`，注释还点名 `nemotron_h` 和 `vibevoice_asr` 已合规——但这两个文件实际都是普通 `@strict`（`:26` / `:30`），全库 `accept_kwargs=True` 只有 1 处（基类），普通 `@strict` 有 752 处 | 1A2 |
+
