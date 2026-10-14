@@ -4,15 +4,15 @@
 > 两条线并行：**架构**（库自身的机制与源码调用链——「原理」）与**模型结构**（主流模型长什么样——「模型」）。
 > 每条线分两级：**入门**先把骨架摸清，**进阶**再啃稀疏/压缩/多模态这些真难点。
 >
-> **24 篇全部完成**（28,401 行）。随手可用的两个入口：
+> **25 篇全部完成**（16,419 行）。随手可用的两个入口：
 > - **[index.html](./index.html)** —— 交互式学习地图：阅读路径 + 进度追踪 + 速查表
-> - **[附录 · 29 条被实测推翻的说法](#附录--29-条被实测推翻的说法)** —— 读之前先扫一眼，能省很多困惑
+> - **[附录 · 31 条被实测推翻的说法](#附录--29-条被实测推翻的说法)** —— 读之前先扫一眼，能省很多困惑
 
 ---
 
 ## 读之前：这套文档的一个前提
 
-写这 24 篇的过程中，**有 29 条流传很广的说法被实测推翻了**（`cache_position` 已删除、
+写这 25 篇的过程中，**有 31 条流传很广的说法被实测推翻了**（`cache_position` 已删除、
 T5 不是 Post-Norm、张量并行不在 `integrations/`……）。
 其中一条甚至会**改变推理结果**——Gemma 2 的 soft-cap 在默认 `sdpa` 后端下被静默丢弃。
 
@@ -28,7 +28,7 @@ T5 不是 Post-Norm、张量并行不在 `integrations/`……）。
 |          | 架构（库机制）            | 模型结构                      |
 |----------|---------------------------|-------------------------------|
 | **入门** | 1A1–1A6：一次 forward / generate / train 走过哪些文件 | 1M1–1M5：decoder-only 骨架 + encoder 对照 |
-| **进阶** | 2A1–2A6：注意力后端 / mask / cache / RoPE / 代码生成 / 权重 | 2M1–2M7：MoE、MLA、SSM、多模态、GLM 压轴 |
+| **进阶** | 2A1–2A7：注意力后端 / mask / cache / RoPE / 代码生成 / 权重 / 接口契约 | 2M1–2M7：MoE、MLA、SSM、多模态、GLM 压轴 |
 
 **两个象限的关系**：1A 讲「库怎么把模型跑起来」，1M 讲「模型本身是什么」。
 进阶同理——2A 讲库为支持这些模型做了哪些机制，2M 讲这些模型的创新点在哪。
@@ -109,14 +109,17 @@ T5 不是 Post-Norm、张量并行不在 `integrations/`……）。
 | 2A4 | RoPE 抽象层 | `ROPE_INIT_FUNCTIONS`（**实测只有 6 个 key，没有 `"default"`**——default 走各模型自带的静态方法）；linear / dynamic / yarn / longrope / llama3 / proportional。**字段已改名 `rope_parameters`**；`rope_config_validation` 已废弃、零调用者 | `modeling_rope_utils.py` | ✅ | 1M1 |
 | 2A5 | **代码生成机制** | `modular_*.py` 如何生成 `modeling_*.py`；`# Copied from` 的同步规则；为什么不能直接改生成文件 | `utils/modular_model_converter.py`、`utils/check_modular_conversion.py`、`utils/check_copies.py`、Makefile 的 `fix-repo` | ✅ | 1M2 |
 | 2A6 | 权重加载、量化与并行 | 跨实现权重映射；量化后端如何挂进来；张量并行 / 专家并行。**两个路径修正**：张量并行本体在 `distributed/tensor_parallel.py`（`integrations/tensor_parallel.py` 只是兼容 shim）；`integrations/moe.py` 不是分片逻辑而是 experts forward 的内核分派 | `core_model_loading.py`、`conversion_mapping.py`、`quantizers/`、`distributed/tensor_parallel.py`、`integrations/moe.py` | ✅ | 1A3 |
+| 2A7 | 注意力接口契约与能力协商 | 契约有三层：硬契约（5 位置参数 + 2-tuple）／协商层（`**kwargs` 是唯一扩展点，**认不出就静默丢**）／准入层（`_supports_*` + `_compatible_flash_implementations`）。**`_supports_sdpa` 默认是 `False`（要显式 opt-in）**；实测 15 个模型禁 sdpa。特化 eager ≠ 不能换后端 | `modeling_utils.py`、`configuration_utils.py`、`modeling_flash_attention_utils.py`、`integrations/*_attention.py` | ✅ | 2A1 |
 
 **建议穿插**：**2A5 已写完（[2A5_modular_code_generation.md](./2A5_modular_code_generation.md)），建议现在就插进来读**——
 它不依赖任何模型结构知识，而且**越早读越好**：它决定了你读后续所有源码的方式（读 modular 而不是生成文件，
 看到自动拉取的类不要当成新东西）。
 2A1 / 2A2 / 2A3 是「注意力三件套」，本质是同一件事的三个侧面：**算什么（后端）、在哪算（mask）、缓存什么（cache）**。建议连着读。
+**2A7 是 2A1 的补篇**：2A1 讲「名字怎么变成函数」，2A7 讲「函数之间凭什么能互换」——
+读完 2A1 你知道怎么换后端，读完 2A7 你知道**换了之后会不会悄悄算错**。建议紧跟在 2A1 后面读。
 
 > **⚠️ 读之前先看一眼**：这套文档涉及的大量「流传很广的说法」**已经在 v5 里失效了**。
-> 完整的 **29 条清单**见文末 [附录 · 29 条被实测推翻的说法](#附录--29-条被实测推翻的说法)。
+> 完整的 **31 条清单**见文末 [附录 · 31 条被实测推翻的说法](#附录--29-条被实测推翻的说法)。
 > 其中一条会**改变推理结果**（Gemma 2 的 soft-cap），在附录里单独高亮。
 > 遇到和记忆冲突的地方，以各篇的「验证清单」为准——那些命令都是实际跑过的。
 
@@ -175,7 +178,7 @@ T5 不是 Post-Norm、张量并行不在 `integrations/`……）。
 1A1 → 1A2 → 1A3 → 1M1 → 1M2 → 1M3 → 1M4 → 1M5
       → 2A5（越早越好，已写完）
       → 1A4 → 1A5 → 1A6
-      → 2A1 → 2A2 → 2A3 → 2A4 → 2A6
+      → 2A1 → 2A7 → 2A2 → 2A3 → 2A4 → 2A6
       → 2M1 → 2M2 → 2M3 → 2M4 → 2M5 → 2M6 → 2M7
 ```
 
@@ -189,43 +192,55 @@ T5 不是 Post-Norm、张量并行不在 `integrations/`……）。
 
 ## 全部文件索引
 
-24 篇全部完成。**22 篇长文都带「速读区（TL;DR）」**——复习时只看前 50 行即可；
-`1M1` / `1M2` 不足 300 行，不需要速读区。24 篇都有「验证清单」。
+25 篇全部完成。**23 篇长文都带「速读区（TL;DR）」**——复习时只看前 50 行即可；
+`1M1` / `1M2` 篇幅短，不需要速读区。25 篇都有「验证清单」。
 
 | 篇 | 文件 | 行数 | 速读区 |
 |----|------|------|--------|
-| 1A1 | `1A1_repo_and_auto.md` | 1242 | ✅ |
-| 1A2 | `1A2_config_system.md` | 1018 | ✅ |
-| 1A3 | `1A3_from_pretrained.md` | 2019 | ✅ |
-| 1A4 | `1A4_tokenizer.md` | 1396 | ✅ |
-| 1A5 | `1A5_generate_loop.md` | 1390 | ✅ |
-| 1A6 | `1A6_trainer.md` | 1185 | ✅ |
+| 1A1 | `1A1_repo_and_auto.md` | 719 | ✅ |
+| 1A2 | `1A2_config_system.md` | 512 | ✅ |
+| 1A3 | `1A3_from_pretrained.md` | 937 | ✅ |
+| 1A4 | `1A4_tokenizer.md` | 759 | ✅ |
+| 1A5 | `1A5_generate_loop.md` | 719 | ✅ |
+| 1A6 | `1A6_trainer.md` | 596 | ✅ |
 | 1M1 | `1M1_llama_structure.md` | 252 | — |
-| 1M2 | `1M2_mistral_sliding_window.md` | 265 | — |
-| 1M3 | `1M3_mixtral_moe.md` | 1091 | ✅ |
-| 1M4 | `1M4_qwen3_dense.md` | 716 | ✅ |
-| 1M5 | `1M5_bert_modernbert.md` | 1275 | ✅ |
-| 2A1 | `2A1_attention_backends.md` | 1552 | ✅ |
-| 2A2 | `2A2_masking_system.md` | 1851 | ✅ |
-| 2A3 | `2A3_kv_cache.md` | 1431 | ✅ |
-| 2A4 | `2A4_rope_abstraction.md` | 1596 | ✅ |
-| 2A5 | `2A5_modular_code_generation.md` | 642 | ✅ |
-| 2A6 | `2A6_weights_quant_parallel.md` | 1389 | ✅ |
-| 2M1 | `2M1_gemma2.md` | 1073 | ✅ |
-| 2M2 | `2M2_deepseek_mla_moe.md` | 1392 | ✅ |
-| 2M3 | `2M3_qwen3_moe.md` | 1270 | ✅ |
-| 2M4 | `2M4_t5_encoder_decoder.md` | 1325 | ✅ |
-| 2M5 | `2M5_mamba2_ssm.md` | 1100 | ✅ |
-| 2M6 | `2M6_llava_next_multimodal.md` | 1238 | ✅ |
-| 2M7 | `2M7_glm_moe_dsa.md` | 693 | ✅ |
-| | **合计** | **28,401** | 22 / 24 |
+| 1M2 | `1M2_mistral_sliding_window.md` | 180 | — |
+| 1M3 | `1M3_mixtral_moe.md` | 566 | ✅ |
+| 1M4 | `1M4_qwen3_dense.md` | 450 | ✅ |
+| 1M5 | `1M5_bert_modernbert.md` | 650 | ✅ |
+| 2A1 | `2A1_attention_backends.md` | 754 | ✅ |
+| 2A2 | `2A2_masking_system.md` | 852 | ✅ |
+| 2A3 | `2A3_kv_cache.md` | 1004 | ✅ |
+| 2A4 | `2A4_rope_abstraction.md` | 1088 | ✅ |
+| 2A5 | `2A5_modular_code_generation.md` | 420 | ✅ |
+| 2A6 | `2A6_weights_quant_parallel.md` | 700 | ✅ |
+| 2A7 | `2A7_attention_contract.md` | 477 | ✅ |
+| 2M1 | `2M1_gemma2.md` | 648 | ✅ |
+| 2M2 | `2M2_deepseek_mla_moe.md` | 865 | ✅ |
+| 2M3 | `2M3_qwen3_moe.md` | 931 | ✅ |
+| 2M4 | `2M4_t5_encoder_decoder.md` | 678 | ✅ |
+| 2M5 | `2M5_mamba2_ssm.md` | 579 | ✅ |
+| 2M6 | `2M6_llava_next_multimodal.md` | 629 | ✅ |
+| 2M7 | `2M7_glm_moe_dsa.md` | 454 | ✅ |
+| | **合计** | **16,419** | 23 / 25 |
 
-> **`index.html`** 是同目录下的学习地图：3 条阅读路径、可勾选的进度追踪、以及下面的 29 条清单。
+> **`index.html`** 是同目录下的学习地图：3 条阅读路径、可勾选的进度追踪、以及下面的 31 条清单。
 > 浏览器直接打开即可（进度存在浏览器本地）。
 
 > **历史沿革**：最早的 `01_llama_structure.md` / `02_mistral_sliding_window.md`
 > 已重命名为 `1M1` / `1M2`，纳入本矩阵。
 > 文档之间用相对链接互引（如 `[1M1](./1M1_llama_structure.md)`）。
+
+---
+
+## 配套速查（不在矩阵编号内）
+
+矩阵之外的两个横向对照文档，随读随查：
+
+| 文档 | 内容 |
+|------|------|
+| [model_evolution.md](./model_evolution.md) | **主流模型结构演化总表**：以 Llama 为基线，Qwen3 / Gemma3·4 / DeepSeek V3·V4 / GLM5.3 / MiniMax M3 / HY4 / Nemotron-H 一行一个，外加五条演化脉络与 modular 继承速查 |
+| [models/](./models/) | 单模型字符画速查（现有 `models/llama.md`：9 张图 + 行号速查），与对应精读篇目互补 |
 
 ---
 
@@ -245,9 +260,9 @@ T5 不是 Post-Norm、张量并行不在 `integrations/`……）。
 
 ---
 
-# 附录 · 29 条被实测推翻的说法
+# 附录 · 31 条被实测推翻的说法
 
-这套文档在写作过程中逐个实测源码，**有 29 条流传很广的说法被推翻**。
+这套文档在写作过程中逐个实测源码，**有 31 条流传很广的说法被推翻**。
 它们散落在各篇的正文和「验证清单」里，这里汇总成一张速查表。
 
 **遇到和记忆冲突的地方，以这里和验证清单为准。** 每条都标了在哪一篇、以及判据。
@@ -298,7 +313,7 @@ T5 不是 Post-Norm、张量并行不在 `integrations/`……）。
 | 注意力注册表含 `"eager"` | 只有 **10 个 key**，**没有 `eager`**——它是 `get_interface(name, default)` 的回退默认值 | 2A1 |
 | llama / mistral 有自己的 `prepare_inputs_for_generation` | 已上提到 **`GenerationMixin`**（`generation/utils.py:519`）；全库 500+ 模型目录只剩 75 处定义 | 1A5 |
 
-## 三、语义反了（方向或含义搞错）— 6 条
+## 三、语义反了（方向或含义搞错）— 7 条
 
 | 流传的说法 | 实测真相 | 篇 |
 |-----------|---------|-----|
@@ -308,8 +323,9 @@ T5 不是 Post-Norm、张量并行不在 `integrations/`……）。
 | 专家并行用 all-to-all 通信 | `all_to_all` 全库**零命中**。是 **all-reduce** 合成输出（`tensor_parallel.py:320` / `:353`） | 2A6 |
 | ModernBERT 的滑动窗口与 Mistral 同向 | 它是**双向 band**（`abs(q_idx - kv_idx) <= w`，`masking_utils.py:149`）；Mistral 是因果的（只看左边）。encoder 里「不能看未来」不成立 | 1M5 |
 | `_LazyAutoMapping` 靠 `__getattr__` 做惰性导入 | 它**没有** `__getattr__`。惰性来自 `_load_attr_from_module` 里的 `importlib.import_module`（`auto_factory.py:612-616`） | 1A1 |
+| 特化了 attention 的模型不能用 sdpa / FA | **看后端有没有对应的表达方式，不是看模型有没有特化**。Gemma 2 特化了 soft-cap，但 `flash_attention_2` 的签名里恰好有 `softcap`（`flash_attention.py:35`）→ **完全可用**；真正不能用的是 attention sink 那类（`gpt_oss` 等 5 个，`modeling_gpt_oss.py:251-252`），因为 sdpa 没有"多加一列"的接口，作者才写 `_supports_sdpa = False` | 2A7 |
 
-## 四、静默行为（不报错，但结果不同）— 5 条
+## 四、静默行为（不报错，但结果不同）— 6 条
 
 | 流传的说法 | 实测真相 | 篇 |
 |-----------|---------|-----|
@@ -318,6 +334,7 @@ T5 不是 Post-Norm、张量并行不在 `integrations/`……）。
 | BERT 的 MLM loss 只对被 mask 的位置算 | 模型算**全序列** cross-entropy（`modeling_bert.py:972-975` 用裸 `CrossEntropyLoss()`）；位置筛选在数据侧（`data_collator.py:831` 把其余位置填 `-100`） | 1M5 |
 | 映射表用 `None` 表示「不支持该任务头」 | 模型映射表里 `None` 出现 **0 次**。「不支持」= 不在表里 → `ValueError`。`None` 只在 tokenizer / processor 映射里表示「可选依赖没装」 | 1A1 |
 | LLaVA-NeXT 屏蔽 image token 的 loss | 模型内**没有**这个屏蔽，图像位置默认要算 loss，屏蔽由数据侧负责 | 2M6 |
+| 不指定 `attn_implementation` 的模型都用 sdpa | `_supports_sdpa` 默认是 **`False`**（`modeling_utils.py:1237`，必须显式 opt-in）。实测 495 个 `modeling_*.py` 只有 340 个写 `= True`；没声明的 141 个里有 **13 个**走了 functional 接口 → 什么都不传时经 `_sdpa_can_dispatch` 抛错被吞、**静默降级 eager**（`modeling_utils.py:1953-1960`，`except` 里无任何日志） | 2A7 |
 
 ## 五、数字与结构（记错了个数和层级）— 4 条
 

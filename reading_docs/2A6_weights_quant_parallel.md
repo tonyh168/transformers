@@ -3,14 +3,11 @@
 > 阅读目标：搞清楚 `from_pretrained` 在**「正常情况下」之外**的三条追加路径——
 > **名字/布局对不上怎么办**（权重映射）、**权重不是 fp16 怎么办**（量化）、**一张卡装不下怎么办**（张量/专家并行）。
 >
-> **这篇在 2A 线里的位置**：它是 2A 的收官篇，也是 1A3 的「进阶版」。
-> 1A3 讲的是**顺利路径**：下载 → 建骨架 → 按 key 灌权重 → 补 missing keys。
-> 2A6 讲的是**不顺利路径**：key 名字不一样、一个 key 要拆成三个、一堆 key 要拼成一个、
-> 权重是 4bit 的、模型要横切到 8 张卡上。**这三件事共用同一套管线**——
-> 这也是本篇最重要的一句话：**权重映射就是加载器本身**，量化和并行都是往这条管线里「插一层 op」。
+> **这篇在 2A 线里的位置**：2A 的收官篇，也是 1A3 的「进阶版」。1A3 讲**顺利路径**（下载 → 建骨架 → 按 key 灌权重 → 补 missing keys）；
+> 2A6 讲**不顺利路径**：key 名字不一样、一个 key 要拆成三个、一堆 key 要拼成一个、权重是 4bit 的、模型要横切到 8 张卡上。
+> **三件事共用同一套管线**——本篇最重要的一句：**权重映射就是加载器本身**，量化和并行都是往这条管线里「插一层 op」。
 >
-> 源文件（全部实测过行数）：
-> `core_model_loading.py`（1853 行）、`conversion_mapping.py`（2005 行）、`fusion_mapping.py`（270 行）、
+> 源文件（全部实测过行数）：`core_model_loading.py`（1853 行）、`conversion_mapping.py`（2005 行）、`fusion_mapping.py`（270 行）、
 > `quantizers/`（`base.py` 342 行 + `auto.py` 370 行 + 25 个 `quantizer_*.py`）、
 > `integrations/tensor_parallel.py`（93 行，**shim**）、`distributed/tensor_parallel.py`（843 行，真实现）、
 > `integrations/moe.py`（582 行）、`integrations/`（47 个 `.py` + 2 个子目录）
@@ -64,43 +61,31 @@
 
 ## 前置知识
 
-- [1A3_from_pretrained.md](./1A3_from_pretrained.md)：**本篇的前置**，讲「顺利路径」——
-  `from_pretrained`（`modeling_utils.py:3881`）→ `cls(config)` 建 meta 骨架 → 灌 checkpoint → 补 missing。
-  它的 §4.1 / §4.2 已经把 `_load_pretrained_model` 与主循环逐行讲过；**本篇不重复**，只讲三个「岔路口」。
-- [1M1_llama_structure.md](./1M1_llama_structure.md)：Llama 的参数名（`model.layers.N.self_attn.q_proj.weight`），本篇所有例子都拿这套名字做对照。
-- [2A4_rope_abstraction.md](./2A4_rope_abstraction.md)：第 7.3 节讲「为什么 RoPE 让 fused QKV 拆不干净」时需要它。
-- [2A5_modular_code_generation.md](./2A5_modular_code_generation.md)：本篇用到了 2A5 里那句 `_tp_plan = {"lm_head": "colwise_gather_output"}`，以及 Olmo2 / Cohere2 的 `base_model_tp_plan`。
-- [1M2_mistral_sliding_window.md](./1M2_mistral_sliding_window.md)：Mixtral 的 MoE 结构（`MixtralSparseMoeBlock`）——本篇第一个 `WeightConverter` 案例就靠它。
+- [1A3_from_pretrained.md](./1A3_from_pretrained.md)：**本篇的前置**（§4.1 / §4.2 已逐行讲过 `_load_pretrained_model` 与主循环，本篇不重复）、[1M1_llama_structure.md](./1M1_llama_structure.md)：Llama 的参数名（例子对照用）。
+- [2A4_rope_abstraction.md](./2A4_rope_abstraction.md)：§7.3「为什么 RoPE 让 fused QKV 拆不干净」的背景、[2A5_modular_code_generation.md](./2A5_modular_code_generation.md)：`_tp_plan = {"lm_head": "colwise_gather_output"}` 的来历、[1M2_mistral_sliding_window.md](./1M2_mistral_sliding_window.md)：Mixtral 的 MoE 结构（第一个 `WeightConverter` 案例靠它）。
 
 ---
 
 ## 一、先划清边界：1A3 到哪为止，2A6 从哪开始
 
-`from_pretrained` 的代码在 `modeling_utils.py:3881`，中间有近 500 行。按「顺不顺利」切开是这样：
+`from_pretrained` 的代码在 `modeling_utils.py:3881`，中间有近 500 行。按「顺不顺利」切开：
 
 | 阶段 | 1A3 讲（顺利路径） | 2A6 讲（追加路径） | 代码位置（实测） |
 |------|-------------------|-------------------|-----------------|
 | 解析 `quantization_config` | — | ✅ 选 quantizer | `quantizers/auto.py:334` `get_hf_quantizer()` |
 | 决定 `device_map` | — | ✅ 多卡 / offload | `integrations/accelerate.py:338` `_get_device_map()` |
 | 建骨架 | ✅ `cls(config)` on meta | ✅ quantizer 替换模块 | `modeling_utils.py:4349` |
-| 取权重映射表 | — | ✅ **本篇第一节** | `conversion_mapping.py:1902` `get_model_conversion_mapping()` |
+| 取权重映射表 | — | ✅ **本篇第三节** | `conversion_mapping.py:1902` `get_model_conversion_mapping()` |
 | 灌权重 | ✅ 「key 一一对应」的直觉模型 | ✅ **两趟循环 + 张量变换** | `core_model_loading.py:1511` `convert_and_load_state_dict_in_model()` |
 | 补 missing / tie weights | ✅ `_init_weights` | ✅ 与量化/Tie 交互 | `modeling_utils.py:4394` → `:4550` `_finalize_model_loading()` |
 
-**一句话**：1A3 里「checkpoint 的 key == 模型的 key」是**默认假设**；
-2A6 讲的全是「这个假设不成立时」发生的补救，以及「补救手段可以被量化和并行复用」。
+**一句话**：1A3 里「checkpoint 的 key == 模型的 key」是**默认假设**；2A6 讲的全是这个假设不成立时的补救，以及「补救手段可以被量化和并行复用」。
 
-> **⚠️ 先破一个直觉**：老版本 transformers 的加载是「遍历 state_dict，`param.copy_(tensor)`」。
-> 现代版本（本仓库当前代码）已经换成了 **`conversion_mapping` 驱动的匹配引擎**：
-> 每个 checkpoint key 先被「改名」，再被「收集」到一个 transform 对象里，
-> 最后由这个对象**算出**目标张量。这个引擎见 `core_model_loading.py:1511` 的 docstring——
-> 它本身就是全篇最好的文档（作者在里面手写了 5 个例子）。
+> **⚠️ 先破一个直觉**：老版本是「遍历 state_dict，`param.copy_(tensor)`」；现代版本已换成 **`conversion_mapping` 驱动的匹配引擎**——每个 checkpoint key 先被「改名」，再被「收集」到一个 transform 对象里，最后由它**算出**目标张量（`core_model_loading.py:1511` 的 docstring 就是全篇最好的文档，作者手写了 5 个例子）。
 
 ---
 
 ## 二、三张表看懂全貌
-
-### 表 2.1 三个子系统，一个管线
 
 | 子系统 | 输入 | 往管线里插什么 | 连接点（实测行号） |
 |--------|------|---------------|------------------|
@@ -108,15 +93,9 @@
 | **量化** | 4bit/8bit/fp8 权重 | ① 替换 `nn.Linear` 为量化模块；② 给 transform 挂 `quantization_operation`（`core_model_loading.py:1679`） | `HfQuantizer.preprocess_model()`（`quantizers/base.py:155`）、`get_quantize_ops()`（`:289`） |
 | **张量/专家并行** | 一张卡装不下 | 把参数换成 `DTensor` 分片占位符 + 给 `forward` 装 input/output 变换 | `apply_tensor_parallelism()`（`distributed/tensor_parallel.py:797`） |
 
-### 表 2.2 每个子系统的入口/出口
+**入口 / 出口**：权重映射 —— 入口 `_MODEL_TO_CONVERSION_PATTERN`（`conversion_mapping.py:42`，94 个 model_type→base 的继承关系）→ `_build_checkpoint_conversion_mapping()`（`:144`，**93 个 key / 640 条 transform**），出口加载 `WeightTransform.convert()` / 保存 `revert_weight_conversion()`（`core_model_loading.py:1798`）；量化 —— `AUTO_QUANTIZER_MAPPING`（`quantizers/auto.py:75`，**26 个 key → 25 个类**）→ `HfQuantizer.postprocess_model()`（`quantizers/base.py:176`）；并行 —— `base_model_tp_plan` / `base_model_ep_plan`（config 类属性，**154 个文件**里有）→ `ALL_PARALLEL_STYLES`（`distributed/tensor_parallel.py:785`，**19 个策略**）。
 
-| 子系统 | 入口 | 出口 |
-|--------|------|------|
-| 权重映射 | `_MODEL_TO_CONVERSION_PATTERN`（`conversion_mapping.py:42`，94 个 model_type→base 的继承关系）→ `_build_checkpoint_conversion_mapping()`（`:144`，**93 个 key / 640 条 transform**） | 加载时：`WeightTransform.convert()`；保存时：`revert_weight_conversion()`（`core_model_loading.py:1798`） |
-| 量化 | `AUTO_QUANTIZER_MAPPING`（`quantizers/auto.py:75`，**26 个 key → 25 个类**） | `HfQuantizer.postprocess_model()`（`quantizers/base.py:176`） |
-| 并行 | `base_model_tp_plan` / `base_model_ep_plan`（config 类属性，**154 个文件**里有） | `ALL_PARALLEL_STYLES`（`distributed/tensor_parallel.py:785`，**19 个策略**） |
-
-### 表 2.3 名字对照（本篇最容易搞混的地方）
+**名字对照（本篇最容易搞混的地方）**：
 
 | 你可能以为是 | 实际是 |
 |-------------|--------|
@@ -134,272 +113,113 @@
 两个子类的公共父类，只做一件事：**把 source/target 模式编译成正则**。
 
 ```python
-# core_model_loading.py:786  __init__ 里最关键的三段
-self.source_patterns  = source_patterns        # 允许 str 或 list
-self.target_patterns  = target_patterns
-
-# 1) target 里的捕获组会被预处理（process_target_pattern, :719）
-# 2) source 里的 \1 反向引用会被解析回捕获组（process_source_pattern, :753）
-# 3) 每个 source 编成一个命名组 g0/g1/...，拼成一条大正则
-branches.append(f"(?P<{group_name}>{pattern})")
+# core_model_loading.py:786  __init__ 的关键
+self.source_patterns = source_patterns ; self.target_patterns = target_patterns
+# target 的捕获组预处理（process_target_pattern :719）+ source 的 \1 解析回捕获组（process_source_pattern :753）
 self.compiled_sources = re.compile("|".join(branches))     # :851
 ```
 
-`*.` 会被展开成 `.*\.`（`:849`），所以 `layers.*.self_attn.q_proj` 就是「任意层号」。
+`*.` 会被展开成 `.*\.`（`:849`），所以 `layers.*.self_attn.q_proj` 就是「任意层号」。两个设计细节：**① `source_patterns` / `target_patterns` 一旦赋值就不能改**（`__setattr__`，`:856`），因为两者通过捕获组互相耦合；**② `scope_prefix`**（`:871` `_scoped_match`）让子模型的映射**只在它自己的子树里生效**（匹配前剥掉前缀、匹配后接回），由 `get_model_conversion_mapping()`（`conversion_mapping.py:1902`）为每个子模块设置。
 
-**两个设计细节值得记**：
+### 3.2 `WeightRenaming`（`core_model_loading.py:992`）：只改名，不碰张量
 
-1. **`source_patterns` / `target_patterns` 一旦赋值就不能改**（`__setattr__`，`:856`）——
-   因为两者通过捕获组互相耦合，改一个会让另一个的正则失效。
-2. **`scope_prefix`**（`:871` `_scoped_match`）：子模型（如 `LlavaForConditionalGeneration.model.language_model`）
-   的映射要**只在它自己的子树里生效**。做法是匹配前先把 `scope_prefix` 剥掉，匹配后再接回去。
-   这是 `get_model_conversion_mapping()`（`conversion_mapping.py:1902`）为每个子模块单独设置的。
+`convert()` 只把收集到的张量挂到新 key 上（`materialize_tensors()` → `collected_tensors`）。**它是主力**：`conversion_mapping.py` 里 **621 行**含 `WeightRenaming(`，而 `WeightConverter(` 只有 **55 处**（`grep -c` 实测）——绝大多数「对不上」只是纯改名。最简单的真实例子（`conversion_mapping.py:711-712`）：`"CLIPVisionModel": [PrefixChange(prefix_to_remove="vision_model")]`、`"CLIPTextModel": [PrefixChange(prefix_to_remove="text_model")]`。
 
-### 3.2 `WeightRenaming`：只改名，不碰张量（`core_model_loading.py:992`）
-
-`__slots__ = ()`，`convert()` 里只做一件事：`target_key = self.target_patterns[0]`，
-然后把收集到的张量挂到新 key 上（`materialize_tensors()` → `collected_tensors`）。
-
-**它是主力**：整个 `conversion_mapping.py` 里 **621 行**含 `WeightRenaming(`，
-而 `WeightConverter(` 只有 **55 处**（`grep -c` 实测）。绝大多数「对不上」只是纯改名。
-
-最简单的真实例子（`conversion_mapping.py:711-712`）：
+### 3.3 `WeightConverter`（`core_model_loading.py:1152`）：改名 + 张量变换
 
 ```python
-"CLIPVisionModel": [PrefixChange(prefix_to_remove="vision_model")],
-"CLIPTextModel":   [PrefixChange(prefix_to_remove="text_model")],
-```
-
-### 3.3 `WeightConverter`：改名 + 张量变换（`core_model_loading.py:1152`）
-
-```python
-# core_model_loading.py:1155
-class WeightConverter(WeightTransform):
+class WeightConverter(WeightTransform):        # core_model_loading.py:1155
     __slots__ = ("operations", "force_cpu")
-
-    def __init__(self, source_patterns, target_patterns, operations: list[ConversionOps], force_cpu=False):
-        ...
-        # 只允许 1:1 / 1:N / N:1，除非用了内部专门的 op
-        if bool(len(self.source_patterns) - 1) + bool(len(self.target_patterns) - 1) >= 2:
-            if not any(isinstance(op, _INTERNAL_MANY_TO_MANY_CONVERSIONS) for op in self.operations):
-                raise ValueError("... you can only have one to many, one to one or many to one.")
+    # 只允许 1:1 / 1:N / N:1，除非用了内部专门的 op
+    if bool(len(self.source_patterns) - 1) + bool(len(self.target_patterns) - 1) >= 2:
+        if not any(isinstance(op, _INTERNAL_MANY_TO_MANY_CONVERSIONS) for op in self.operations):
+            raise ValueError("... you can only have one to many, one to one or many to one.")
 ```
-
-**基数限制是硬约束**（实测）：
-- `N:1`（多个 key 合成一个）：如 mixtral 的 expert 堆叠
-- `1:N`（一个 key 拆成多个）：如 fused QKV 拆成 q/k/v
-- `N:N`：**只允许 `_INTERNAL_MANY_TO_MANY_CONVERSIONS` 里的 op**（`core_model_loading.py:1147`），
-  实测只有两个类：`ErnieFuseAndSplitTextVisionExperts`（`:596`）、`ErnieSplitAndDecoupleTextVisionExperts`（`:657`）
-
-`convert()`（`:1175`）的执行顺序：
-```
-materialize_tensors()                    ← 把所有 Future 变成真张量（异步加载的收口点）
-  → for op in self.operations: op.convert(...)   ← 链式，前一个的输出是后一个的输入
-  → 把 target 短名展开成完整 key（利用 layer_name 的前缀/后缀）
-  → 若挂了 quantization_operation（量化加载）→ 再跑一遍
-```
+**基数限制是硬约束**：`N:1`（多 key 合成一个，如 mixtral expert 堆叠）、`1:N`（一个 key 拆多个，如 fused QKV 拆 q/k/v）、`N:N` **只允许 `_INTERNAL_MANY_TO_MANY_CONVERSIONS`**（`core_model_loading.py:1147`）——实测只有 `ErnieFuseAndSplitTextVisionExperts`（`:596`）与 `ErnieSplitAndDecoupleTextVisionExperts`（`:657`）。
+`convert()`（`:1175`）的执行顺序：`materialize_tensors()`（Future → 真张量，异步加载的收口点）→ `for op in self.operations: op.convert(...)`（链式，前一个的输出是后一个的输入）→ 把 target 短名展开成完整 key → 若挂了 `quantization_operation` 再跑一遍。
 
 ### 3.4 `ConversionOps`：真实存在的张量算子全集
 
-`ConversionOps`（`core_model_loading.py:81`）是 ABC，只有 `convert()` + `reverse_op` 两个抽象成员。
-实测这一类里**一共 15 个类**（1 个 ABC + 14 个具体算子，其中两个 `Vision*ForRope` 合并成一行），清单如下：
+`ConversionOps`（`core_model_loading.py:81`）是 ABC，只有 `convert()` + `reverse_op` 两个抽象成员。实测这一类里**一共 15 个类**（1 个 ABC + 14 个具体算子，其中两个 `Vision*ForRope` 合并成一行）：
 
 | 算子 | 行号 | 干什么 | 反向算子 |
 |------|------|--------|----------|
 | `_IdentityOp` | `:101` | 直通（给反量化用，权重已是目标 dtype） | — |
-| `Chunk` | `:112` | 沿 `dim` 均分 → **1:N** | `Concatenate` |
-| `Concatenate` | `:150` | 沿 `dim` 拼接 → **N:1** | `Chunk` |
+| `Chunk` / `Concatenate` | `:112` / `:150` | 沿 `dim` 均分（**1:N**）/ 拼接（**N:1**） | 互为反向 |
 | `Interleave` | `:195` | 沿 `dim` 拆两半后转置 → 去交错（gate/up 交错布局 → 拼接布局） | `Interleave(inverse=True)` |
-| `MergeModulelist` | `:222` | 把一组张量 `torch.stack` 成一块 → **N:1，expert 堆叠专用** | `SplitModulelist` |
-| `SplitModulelist` | `:273` | `torch.chunk` 回一组张量 | `MergeModulelist` |
+| `MergeModulelist` / `SplitModulelist` | `:222` / `:273` | `torch.stack` 成一块（**N:1，expert 堆叠专用**）/ `torch.chunk` 拆回 | 互为反向 |
 | `Transpose` | `:312` | 交换两个维度（可选 `check_dims` 校验） | 同（交换回去） |
-| `Conv3dToLinear` | `:362` | Conv3d patch embedding → 等价的 Linear | `LinearToConv3d` |
-| `LinearToConv3d` | `:402` | 上者的反向 | `Conv3dToLinear` |
+| `Conv3dToLinear` / `LinearToConv3d` | `:362` / `:402` | Conv3d patch embedding ↔ 等价的 Linear | 互为反向 |
 | `PermuteForRope` | `:428` | **complex-RoPE 权重 → split sin/cos 布局的置换** | 自带 `inverse` |
 | `VisionFuseAndPermuteForRope` | `:488` | `PermuteForRope` + `Concatenate` 的合并版（只对子集做置换） | `VisionUnfuseAndPermuteForRope` `:542` |
-| `ErnieFuseAndSplitTextVisionExperts` | `:596` | text/vision 两套 expert 的 fuse+split（**N:N**） | `ErnieSplitAndDecouple...` `:657` |
-| `ErnieSplitAndDecoupleTextVisionExperts` | `:657` | 上者的反向 | — |
+| `ErnieFuseAndSplitTextVisionExperts` / `ErnieSplitAndDecoupleTextVisionExperts` | `:596` / `:657` | text/vision 两套 expert 的 fuse+split（**N:N**）/ 其反向 | 互为反向 |
 
-`MergeModulelist` 的 docstring 有一句值得抄下来：
+`MergeModulelist` 的 docstring：「Merge a list of tensors into a single tensor along the first dimension. **We explicitly define this because for EP or TP you want to make sure you know what you are doing!**」
 
-> Merge a list of tensors into a single tensor along the first dimension.
-> **We explicitly define this because for EP or TP you want to make sure you know what you are doing!**
+### 3.5 五个真实案例
 
-### 3.5 五个真实案例（逐个讲清它在解决什么）
+**案例 A：N 个独立 expert 张量 → 一块 3D `nn.Parameter`（`mixtral`）**
 
-#### 案例 A：N 个独立 expert 张量 → 一块 3D `nn.Parameter`（`mixtral`）
-
-**问题**：Mixtral 的 HF checkpoint 把每个专家存成独立的 key：
-`model.layers.N.block_sparse_moe.experts.{i}.w1.weight`（共 8 个专家 × 3 个投影 = 24 个 key/层）。
-但模型里 `experts` 是**打包成 3D 张量**的（`gate_up_proj` / `down_proj` 各一块 `nn.Parameter`）。
-
-**解法**（`conversion_mapping.py:992-1018`，原文注释就在代码里）：
+Mixtral 的 HF checkpoint 把每个专家存成独立 key（`model.layers.N.block_sparse_moe.experts.{i}.w1.weight`，8 专家 × 3 投影 = 24 key/层），但模型里 `experts` 是**打包成 3D 张量**的（`gate_up_proj` / `down_proj` 各一块 `nn.Parameter`）。解法（`conversion_mapping.py:992-1018`）：
 
 ```python
 "mixtral": [
     WeightRenaming(".block_sparse_moe.", ".mlp."),        # :993  纯改名，先做
     WeightConverter(
-        source_patterns=[".experts.*.w1.weight", ".experts.*.w3.weight"],  # 2 个 source
-        target_patterns=".experts.gate_up_proj",                           # 1 个 target → N:1
-        operations=[
-            MergeModulelist(dim=0),   # 每个 source 的 8 个张量各自 stack → 2 个 (8, I, H)
-            Concatenate(dim=1),       # 2 个 → 拼成 (8, 2I, H)；同时完成「改名」这一步
-        ],
+        source_patterns=[".experts.*.w1.weight", ".experts.*.w3.weight"],  # 2 source
+        target_patterns=".experts.gate_up_proj",                           # 1 target → N:1
+        operations=[MergeModulelist(dim=0),   # 各 source 的 8 个张量各自 stack → 2 个 (8, I, H)
+                    Concatenate(dim=1)],      # 拼成 (8, 2I, H)；同时完成「改名」
     ),
-    WeightConverter(
-        source_patterns=[".experts.*.w2.weight"],
-        target_patterns=".experts.down_proj",
-        operations=[MergeModulelist(dim=0)],   # 只需 stack
-    ),
+    WeightConverter(source_patterns=[".experts.*.w2.weight"], target_patterns=".experts.down_proj",
+                    operations=[MergeModulelist(dim=0)]),   # 只需 stack
 ],
 ```
 
-**两个必须记住的机制点**：
+两个必须记住的机制点：**① 改名发生在 chain 的最后一环**——`MergeModulelist` 之后 key 还是 source 模式（它要处理一整组 key，不能提前收窄），只有 `Concatenate`/单 op 结束时才落到 target 名（规则写在 `MergeModulelist.get_target_pattern()`，`:257` 的注释里）；**② 顺序不能颠倒**——`MergeModulelist` 必须在 `Concatenate` 之前（`conversion_mapping.py:1005` 原文注释「we can't shard after concats and merge, needs to be first」）。
 
-1. **改名发生在 chain 的最后一环**。`MergeModulelist` 之后 key 还是 source 模式
-   （因为它要处理一整组 key，不能提前收窄），只有 `Concatenate`/单 op 结束时才落到 target 名。
-   这个规则写在 `MergeModulelist.get_target_pattern()`（`:257`）的注释里：
-   「Here it's the first operation in a chain, so we use the source as they were replaced before in the chain」。
-2. **顺序不能颠倒**。`MergeModulelist` 必须在 `Concatenate` 之前——
+同一套写法被**复用了 9 次**（精确字符串 `MergeModulelist(dim=0), Concatenate(dim=1)` 命中 9 行；`MergeModulelist(dim=0)` 总计 **20 处**），覆盖 9 个模型 key：`axk2`（`:236`）、`deepseek_v4`（`:483`）、`glm5_next`（`:535`）、`minimax_m3_vl`（`:590`）、`deepseek_ocr2`（`:759`）、`qwen2_moe`（`:1019`）、`phimoe`（`:1067`）、`lfm2_moe`（`:1084`）、`jamba`（`:1287`）。
+`qwen2_moe` 的映射（`:1019-1032`）是**继承枢纽**：`_MODEL_TO_CONVERSION_PATTERN`（`:42`）里有 **22 个 model_type 指向 `"qwen2_moe"`**（`deepseek_v2` / `deepseek_v3` / `glm4_moe` / `glm_moe_dsa` / `qwen3_moe` / `olmoe` / `hunyuan_v1_moe` …），最后在 `:1836-1839` 用 `mapping[model_type] = mapping[base_pattern].copy()` 展开。
 
-```python
-# conversion_mapping.py:1005（原文注释）
-# we want the loading to add this shard operation here.
-# Though we can't shard after concats and merge, needs to be first
-```
+**案例 B：一块 fused QKV → q/k/v 三份（`Chunk`）** —— 三个实测例子：`radio`（`conversion_mapping.py:289-297`，`attn.qkv` → `attention.attention.{query,key,value}`）、`Tipsv2VisionModel`（`:1603`，converter 在 `:1619-1627`，`.attn.qkv.weight` → 三份 weight）、`hrm_text`（`:299`，converter 在 `:305-314`，`attn.gqkv_proj.weight` → **4 份**：`gate_proj` / `q_proj` / `k_proj` / `v_proj`），operations 都是 `[Chunk(dim=0)]`。
+`hrm_text` 是 1:4，最能说明语义：`torch.chunk(tensor, num_shards, dim=self.dim)`（`core_model_loading.py:130`），**切几份完全由 target 个数决定**。
 
-同一套写法被**复用了 9 次**（精确字符串 `MergeModulelist(dim=0), Concatenate(dim=1)` 命中 9 行；
-`MergeModulelist(dim=0)` 单用/组合总计 **20 处**），
-覆盖 9 个不同的模型 key：`axk2`（key 在 `:236`）、`deepseek_v4`（`:483`）、`glm5_next`（`:535`）、
-`minimax_m3_vl`（`:590`）、`deepseek_ocr2`（`:759`）、`qwen2_moe`（`:1019`）、`phimoe`（`:1067`）、
-`lfm2_moe`（`:1084`）、`jamba`（`:1287`）——
-因为「DeepSeek/Qwen 系 MoE checkpoint 用独立 key 存专家」是社区事实标准。
+**案例 C：先置换再拆 —— RoPE 布局转换（`kimi_k25`）**
 
-> `qwen2_moe` 的映射（`:1019-1032`）是**继承枢纽**：`_MODEL_TO_CONVERSION_PATTERN`（`:42`）
-> 里有 **22 个 model_type 指向 `"qwen2_moe"`**（实测 AST 计数；`deepseek_v2` / `deepseek_v3` / `glm4_moe` / `glm_moe_dsa` /
-> `qwen3_moe` / `olmoe` / `hunyuan_v1_moe` …），最后在 `:1836-1839` 用 `mapping[model_type] = mapping[base_pattern].copy()` 展开。
-
-#### 案例 B：一块 fused QKV → q/k/v 三份（`Chunk`，3 个真实实现）
-
-**问题**：很多 checkpoint（CLIP 系、timm 系、Kimi 的视觉塔）把 QKV 拼成一个 `qkv` / `wqkv` / `in_proj_weight`。
-模型侧则是三个独立的 `nn.Linear`。
-
-**三个实测例子**：
-
-| 模型 | 行号 | source | target | operations |
-|------|------|--------|--------|-----------|
-| `radio` | `conversion_mapping.py:289-297` | `attn.qkv` | `attention.attention.{query,key,value}` | `[Chunk(dim=0)]` |
-| `Tipsv2VisionModel` | `:1603`（converter 在 `:1619-1627`） | `.attn.qkv.weight` | `.attention.attention.{query,key,value}.weight` | `[Chunk(dim=0)]` |
-| `hrm_text` | `:299`（converter 在 `:305-314`） | `attn.gqkv_proj.weight` | **4 份**：`gate_proj` / `q_proj` / `k_proj` / `v_proj` | `[Chunk(dim=0)]` |
-
-`hrm_text` 是 1:4，最能说明 `Chunk` 的语义：`torch.chunk(tensor, num_shards, dim=self.dim)`
-（`core_model_loading.py:130`），**切几份完全由 target 个数决定**。
-
-#### 案例 C：先置换再拆 —— RoPE 布局转换（`kimi_k25`）
-
-**问题**：更麻烦的情况是「fused QKV **而且** RoPE 用的是 complex 布局」。
-checkpoint 里 q/k 的权重是按 `(real, imag)` 交错的复数布局排的，模型里要的是
-「前半 = sin 部分，后半 = cos 部分」的 split 布局。
-
-**解法**（`conversion_mapping.py:469-481`，注意作者自己写的注释）：
+「fused QKV **而且** RoPE 用 complex 布局」：checkpoint 里 q/k 权重按 `(real, imag)` 交错排，模型里要「前半 sin、后半 cos」的 split 布局。解法（`conversion_mapping.py:469-481`）：
 
 ```python
-# Unfuse qkv and apply rope permutation
-WeightConverter(
-    source_patterns=[r"wqkv"],
-    target_patterns=[r"attn.q_proj", r"attn.k_proj", r"attn.v_proj"],
-    operations=[
-        Chunk(dim=0),   # 先拆成三份
-        PermuteForRope(                      # 再对 q/k 做 head 内的交错→拆分置换
-            subconfig_key="vision_config",   # ← 用 vision_config 的 num_attention_heads
-            permute_layer_names=["q_proj", "k_proj"],   # ← v 不置换
-        ),
-    ],
-),
+# conversion_mapping.py:469-481  Unfuse qkv and apply rope permutation
+WeightConverter(source_patterns=[r"wqkv"], target_patterns=[r"attn.q_proj", r"attn.k_proj", r"attn.v_proj"],
+    operations=[Chunk(dim=0),   # 先拆成三份
+        PermuteForRope(subconfig_key="vision_config",               # ← vision_config 的 num_attention_heads
+                       permute_layer_names=["q_proj", "k_proj"])])  # ← 再对 q/k 置换，v 不置换
 ```
 
-`PermuteForRope`（`core_model_loading.py:428`）的核心几行（`:445-451`）：
+`PermuteForRope`（`core_model_loading.py:428`）的核心（`:445-451`）：`head_shape = (2, half_head) if self.inverse else (half_head, 2)` → `tensor.view(n_heads, *head_shape, ...)`（`:450`）→ `transpose(1, 2).reshape(dim0, ...)`（`:451`）。
+**这就是「RoPE 不能直接 fuse」的第一个硬证据**：RoPE 让 Q/K 的**权重内存布局**和 V 不同类，拆 fused QKV 时**不能只 Chunk**。同一套 `Chunk + PermuteForRope` 实测只有 **2 处**：`kimi_k25`（`:469-481`，key 在 `:430`，1→3，只对 q/k 置换）与 `step3p5_vision`（`:903-927`，key 在 `:886`，weight 和 bias 各置换一次）。
+**反例**：`Tipsv2VisionModel`（`:1603`）的 `attn.qkv.weight`（`:1619-1627`）和 `attn.qkv.bias`（`:1628-1636`）就是**纯 `Chunk(dim=0)`，没有 `PermuteForRope`**（原因不在这份映射文件里，**不做推断**）。结论：**「拆 fused QKV 要不要附带置换」是逐模型的。**
 
-```python
-head_shape = (2, half_head) if self.inverse else (half_head, 2)
-tensor = tensor.view(n_heads, *head_shape, ...)   # :450
-tensor = tensor.transpose(1, 2).reshape(dim0, ...)  # :451
-```
+**案例 D：只转置（`qwen3_vl_moe`，`conversion_mapping.py:1034-1044`）** —— `source_patterns` 与 `target_patterns` **同名**（都是 `mlp.experts.gate_up_proj`），`operations=[Transpose(1, 2, check_dims=True)]`。同名不是笔误：模型侧形状写死在 `models/qwen3_vl_moe/modeling_qwen3_vl_moe.py:97`（`nn.Parameter(torch.empty(num_experts, 2 * intermediate_dim, hidden_dim))`），checkpoint 那边只能是 `(E, hidden, 2I)`，差一个 `transpose(1, 2)`；`check_dims=True` 让维度不符时**报错而不是静默出错**。`down_proj` 同理（`:1040-1044`，模型形状见同文件 `:98`）。
 
-**这就是「RoPE 不能直接 fuse」的第一个硬证据**：RoPE 让 Q/K 的**权重内存布局**和 V 不同类，
-所以拆 fused QKV 时**不能只 Chunk**，必须给 q/k 附一个额外的置换。
-
-同一套 `Chunk + PermuteForRope` 组合实测只有 **2 处**（`grep -n 'Unfuse qkv and apply rope permutation'`）：
-
-| 位置 | 模型 key | source | 说明 |
-|------|---------|--------|------|
-| `:469-481` | `kimi_k25`（key 在 `:430`） | `wqkv` | 1→3，`subconfig_key="vision_config"`，只对 q/k 置换 |
-| `:903-927` | `step3p5_vision`（key 在 `:886`） | `attn.in_proj_weight` **和** `attn.in_proj_bias` | 两个 converter，weight 和 bias 各置换一次 |
-
-**反例（说明不是所有 fuse 都带 RoPE 问题）**：`Tipsv2VisionModel`（key 在 `:1603`）的
-`attn.qkv.weight`（`:1619-1627`）和 `attn.qkv.bias`（`:1628-1636`）就是**纯 `Chunk(dim=0)`，没有 `PermuteForRope`**。
-原因（该模型内部的 RoPE 实现差异）不在这份映射文件里，此处**不做推断**——以仓库实际代码为准。
-但结论是清楚的：**「拆 fused QKV 要不要附带置换」是逐模型的，不能一概而论。**
-
-
-#### 案例 D：只转置（`qwen3_vl_moe`，`conversion_mapping.py:1034-1044`）
-
-```python
-"qwen3_vl_moe": [
-    WeightConverter(
-        source_patterns="mlp.experts.gate_up_proj",   # 名字一样
-        target_patterns="mlp.experts.gate_up_proj",   # 名字一样！
-        operations=[Transpose(1, 2, check_dims=True)],  # 只换轴顺序
-    ),
-    ...
-]
-```
-
-**source 和 target 同名不是笔误**：这个模型两边都是「一块 3D expert 张量」，但轴序不同。
-模型侧的参数形状是写死的：`models/qwen3_vl_moe/modeling_qwen3_vl_moe.py:97`
-`self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))`，
-所以 checkpoint 那边只能是 `(E, hidden, 2I)`，两边差一个 `transpose(1, 2)`。
-`check_dims=True` 让 `Transpose.convert()` 在维度不符时报错而不是静默出错。
-`down_proj` 同理（`:1040-1044`），模型形状见同一文件 `:98`。
-
-> **一句实话**：我特意找了「MoE expert **顺序重排**（permute expert indices）」这种需求，
-> 在 `conversion_mapping.py` 里**没有找到**。expert 维度上仓库只做 stack（`MergeModulelist`）、
-> split（`SplitModulelist`）、transpose（`Transpose`），**没有 expert 顺序的置换算子**。
-> 如果某个 checkpoint 的 expert 顺序和模型不一致，当前代码里没有现成手段——以仓库实际代码为准。
-
-#### 案例 E：N:N 的唯一用法（`ernie4_5_vl_moe`，`:1099`）
-
-这个模型同时有 text MoE 和 vision MoE，checkpoint 里两者**共用一组 expert key**，
-而模型里是两套独立参数。所以它用了一个真正的 2→2：
+**案例 E：N:N 的唯一用法（`ernie4_5_vl_moe`，`:1099`）** —— text MoE 与 vision MoE 在 checkpoint 里**共用一组 expert key**，模型里是两套独立参数，所以用了真正的 2→2（`conversion_mapping.py:1139-1149`）：
 
 ```python
 # conversion_mapping.py:1139-1149
 WeightConverter(
     source_patterns=["experts.*.gate_proj.weight", "experts.*.up_proj.weight"],   # 2
     target_patterns=["text_moe.experts.gate_up_proj", "vision_moe.experts.gate_up_proj"],  # 2
-    operations=[ErnieFuseAndSplitTextVisionExperts(stack_dim=0, concat_dim=1)],
-),
+    operations=[ErnieFuseAndSplitTextVisionExperts(stack_dim=0, concat_dim=1)])
 ```
 
-**这是仓库里唯一真正用到 2→2 的地方**（`grep -o 'ErnieFuseAndSplitTextVisionExperts('` 实测 2 处，
-另一处 `:1131-1138` 是 1→2 的 `down_proj`），靠的就是
-`_INTERNAL_MANY_TO_MANY_CONVERSIONS`（`core_model_loading.py:1147`）的白名单机制。
+**这是仓库里唯一真正用到 2→2 的地方**（`grep -o 'ErnieFuseAndSplitTextVisionExperts('` 实测 2 处，另一处 `:1131-1138` 是 1→2 的 `down_proj`），靠 `_INTERNAL_MANY_TO_MANY_CONVERSIONS`（`core_model_loading.py:1147`）的白名单机制。
 
-### 3.6 三个 `WeightRenaming` 子类：把常见正则写成 API
+> **一句实话**：我特意找了「MoE expert **顺序重排**」这种需求，在 `conversion_mapping.py` 里**没有找到**——expert 维上仓库只做 stack / split / transpose，**没有 expert 顺序的置换算子**（以仓库实际代码为准）。
 
-| 子类 | 行号 | 解决的问题 | 实测用法 |
-|------|------|-----------|---------|
-| `PrefixChange` | `core_model_loading.py:1098` | 「整块前缀加/删」的老正则太丑 | **11 处**：`:711` `CLIPVisionModel` 删 `vision_model`、`:751` 加 `language_model`、`:929` `colqwen2` 删 `model`、`:930` `shieldgemma2` 加 `model`、`:931` `timm_wrapper` 加 `timm_model`、`:978` `qwen3_5_text` 删 `language_model`、`:1819-1820` 删 `model` / `mtp` |
-| `GroupWeightRename` | `:1032` | **链式改名会重复施加**：`norm0→norm1` 且 `norm1→norm2`，如果加载一个**已经转换过**的 checkpoint（只有 `norm1`/`norm2`，没有 `norm0`），第二条会被误触发，把 `norm1` 又改成 `norm2` | **2 处**，都在 `kimi_k25`：`:436-455`（`norm0/norm1` → `norm1/norm2`、`mlp.fc0/fc1` → `mlp.fc1/fc2`） |
+### 3.6 两个 `WeightRenaming` 子类
 
-`GroupWeightRename` 的机制是一个「守卫模式」：**只有第一个（guard）source 出现过，后续 rename 才激活**
-（`rename_source_key`，`:1056`）。docstring 里还留了一个关键约束：
-
-> NOTE: order `source_patterns` so that the one that is absent in an already-converted checkpoint
-> comes first. The state dict is iterated in sorted key order, so the guard pattern must be
-> lexicographically smaller than the dependent patterns.
-
-**这个坑很真实**：state_dict 是**按 key 排序**遍历的，所以守卫必须在字典序上更小，否则永远轮不到它先出现。
+- `PrefixChange`（`core_model_loading.py:1098`）：「整块前缀加/删」，**11 处**：`:711` `CLIPVisionModel` 删 `vision_model`、`:751` 加 `language_model`、`:929` `colqwen2` 删 `model`、`:930` `shieldgemma2` 加 `model`、`:931` `timm_wrapper` 加 `timm_model`、`:978` `qwen3_5_text` 删 `language_model`、`:1819-1820` 删 `model` / `mtp`。
+- `GroupWeightRename`（`:1032`）：**链式改名会重复施加**（`norm0→norm1` 且 `norm1→norm2`，加载**已转换过**的 checkpoint 时第二条会被误触发）。**2 处**，都在 `kimi_k25`（`:436-455`）。机制是「守卫模式」：**只有第一个（guard）source 出现过，后续 rename 才激活**（`rename_source_key`，`:1056`）。docstring 的关键约束：「order `source_patterns` so that the one that is absent in an already-converted checkpoint comes first. The state dict is iterated in sorted key order, so the guard pattern must be lexicographically smaller than the dependent patterns.」——state_dict 是**按 key 排序**遍历的。
 
 ### 3.7 映射是按什么注册的？（三级查找，实测）
 
@@ -407,18 +227,13 @@ WeightConverter(
 # conversion_mapping.py:144
 def _build_checkpoint_conversion_mapping():
     mapping = { "cosmos3_edge": [...], "axk2": [...], ... }   # 93 个 key
-    # ... 中间有大量 mapping["x"] = mapping["base"].copy() + [...] 的继承拼接
     for model_type, base_pattern in _MODEL_TO_CONVERSION_PATTERN.items():   # :1836
-        if model_type in mapping:
-            continue
+        if model_type in mapping: continue
         mapping[model_type] = mapping[base_pattern].copy()   # :1839
     return mapping
 ```
 
-**注册表名**：`_checkpoint_conversion_mapping_cache`（`conversion_mapping.py:1844`，模块级懒加载缓存，
-`deepcopy` 出去防止调用方污染，见 `:1851`）。
-
-**查找顺序**（`get_model_conversion_mapping()`，`:1902`）——这是本篇关于「名字对不上那一层」最关键的答案：
+**注册表名**：`_checkpoint_conversion_mapping_cache`（`conversion_mapping.py:1844`，模块级懒加载缓存，`deepcopy` 出去防止污染，见 `:1851`）。**查找顺序**（`get_model_conversion_mapping()`，`:1902`）——本篇关于「名字对不上那一层」最关键的答案：
 
 ```
 for module_name, submodule in model.named_modules():
@@ -428,25 +243,13 @@ for module_name, submodule in model.named_modules():
     4. 按【类名】查（优先！允许 ForXxx 级覆盖）  get_checkpoint_conversion_mapping(class_name)
     5. 没查到 → 按【model_type】查
     6. 子模块 → 给每条 transform 设 scope_prefix，只在子树内生效
-    7. 最后追加 get_checkpoint_conversion_mapping("legacy")  ← :1995-1996  通用兜底（LayerNorm.gamma/beta → weight/bias，映射表在 `:1399`）
+    7. 最后追加 get_checkpoint_conversion_mapping("legacy")  ← :1995-1996  通用兜底（LayerNorm.gamma/beta → weight/bias，映射表在 :1399）
     8. 交给 quantizer 改写：weight_conversions = hf_quantizer.update_weight_conversions(...)  ← :2003
 ```
 
-**三级 = 类名 → model_type → legacy**。类名优先是为了让 `LlavaModel` 嵌在
-`LlavaForConditionalGeneration` 里时还能拿到自己的 scoped 映射（代码注释在 `:1957-1961`）。
+**三级 = 类名 → model_type → legacy**。类名优先是为了让 `LlavaModel` 嵌在 `LlavaForConditionalGeneration` 里时还能拿到自己的 scoped 映射（注释 `:1957-1961`）。**用户扩展 API**（`:1857`）：`register_checkpoint_conversion_mapping(model_type_or_class_name, mapping, overwrite=False)`，会记进 `USER_REGISTERED_MAPPINGS`（`:1854`）。
 
-**用户扩展 API**（`:1857`）：
-
-```python
-def register_checkpoint_conversion_mapping(model_type_or_class_name, mapping, overwrite=False) -> None
-# 会记进 USER_REGISTERED_MAPPINGS（:1854），从而让 custom code 模型也能享受映射
-```
-
-> **保存是反向的**：`revert_weight_conversion()`（`core_model_loading.py:1798`）把每条 transform
-> `reverse_transform()`（`:934`）——source/target 对调，`operations` 用各自的 `reverse_op` 反向排列。
-> 触发点是 `save_pretrained(save_original_format=True)`（`modeling_utils.py:3310` / `:3520`）。
-> **不支持反向的情况**：挂了 `quantization_operation` 或 TP 时会直接 `raise ValueError`
-> （`:936-938`）——所以想存回原始格式，就得让 quantizer 自己处理（见第六节）。
+> **保存是反向的**：`revert_weight_conversion()`（`core_model_loading.py:1798`）把每条 transform `reverse_transform()`（`:934`）——source/target 对调，`operations` 用各自的 `reverse_op` 反向排列。触发点是 `save_pretrained(save_original_format=True)`（`modeling_utils.py:3310` / `:3520`）。**不支持反向的情况**：挂了 `quantization_operation` 或 TP 时会直接 `raise ValueError`（`:936-938`）。
 
 ---
 
@@ -454,117 +257,33 @@ def register_checkpoint_conversion_mapping(model_type_or_class_name, mapping, ov
 
 ### 4.1 与 1A3 的衔接
 
-```
-from_pretrained()                                    modeling_utils.py:3881
-  ├─ hf_quantizer, config, device_map = get_hf_quantizer(...)         :4270   ← 2A6
-  ├─ config 解析 / fusion 注册 / kernel 注册                          :4331-4341  ← 2A6（fusion）
-  ├─ model = cls(config)  (meta 骨架)                                 :4350   ← 1A3
-  ├─ hf_quantizer.preprocess_model(model, ...)                        :4354   ← 2A6（量化改模型）
-  ├─ dtype_plan = model._get_dtype_plan(dtype)                        :4364
-  ├─ weight_conversions = get_model_conversion_mapping(...)           :4367   ← 2A6（本节主角）
-  ├─ model = cls.maybe_distribute_model(model, ...)                   :4369   ← 2A6（TP/FSDP/PP）
-  ├─ device_map = _get_device_map(model, ...)                         :4373   ← 2A6（offload）
-  ├─ load_config = LoadStateDictConfig(..., weight_mapping=weight_conversions, ...)  :4377
-  └─ loading_info, disk_offload_index = cls._load_pretrained_model(...)  :4393
-       └─ convert_and_load_state_dict_in_model(...)                   core_model_loading.py:1511  ★
-```
+`from_pretrained()`（`modeling_utils.py:3881`）里，2A6 相关的步骤依次是：`get_hf_quantizer`（`:4270`）→ config 解析 / fusion 注册 / kernel 注册（`:4331-4341`）→ `cls(config)` meta 骨架（`:4350`，1A3）→ `hf_quantizer.preprocess_model`（`:4354`）→ `_get_dtype_plan`（`:4364`）→ `get_model_conversion_mapping`（`:4367`）→ `maybe_distribute_model`（`:4369`，TP/FSDP/PP）→ `_get_device_map`（`:4373`）→ `LoadStateDictConfig(..., weight_mapping=...)`（`:4377`）→ `cls._load_pretrained_model`（`:4393`）→ `convert_and_load_state_dict_in_model`（`core_model_loading.py:1511` ★）。
 
-**`_load_pretrained_model`（`modeling_utils.py:4436`，调用点在 `:4393`）只负责「准备」**：
-- 读 checkpoint 文件（safetensors 用 `safe_open` 拿 `get_slice`，**故意不 materialize**，`:4527`）
-- `verify_tp_plan()` 检查 tp_plan 有没有写错的策略名 / 没覆盖到的层（`modeling_utils.py:4455`）
-- `accelerate_disk_offload()` 准备 disk offload（`:4461`）
-- `caching_allocator_warmup()` 预热 CUDA allocator（`:4473`；函数定义在 `modeling_utils.py:5071`）
-- DeepSpeed ZeRO-3 走一条独立分支（`:4477`，那条路**不做** conversion，注释说明「assume perfectly matching checkpoints」）
-
-**真正的转换发生在 `convert_and_load_state_dict_in_model()`**（`core_model_loading.py:1511`）。
+**`_load_pretrained_model`（`modeling_utils.py:4436`，调用点在 `:4393`）只负责「准备」**：读 checkpoint 文件（safetensors 用 `safe_open` 拿 `get_slice`，**故意不 materialize**，`:4527`）、`verify_tp_plan()` 检查策略名/覆盖率（`:4455`）、`accelerate_disk_offload()`（`:4461`）、`caching_allocator_warmup()`（`:4473`，函数定义在 `:5071`）、DeepSpeed ZeRO-3 独立分支（`:4477`，那条路**不做** conversion）。**真正的转换发生在 `convert_and_load_state_dict_in_model()`**（`core_model_loading.py:1511`）。
 
 ### 4.2 这个函数在干什么（两趟循环）
 
-**先说清楚分工**：`convert_and_load_state_dict_in_model` 的主循环骨架（`sorted(..., dot_natural_key)` →
-`rename_source_key` → `param_name_to_load.setdefault` → `spawn_materialize` → `mapping.convert`）
-**1A3 的 §4.2 已经逐行讲过**（[1A3_from_pretrained.md](./1A3_from_pretrained.md)），本篇不重复。
-这里只补 1A3 没展开、但属于「进阶路径」的三件事。
+主循环骨架（`sorted(..., dot_natural_key)` → `rename_source_key` → `param_name_to_load.setdefault` → `spawn_materialize` → `mapping.convert`）**1A3 的 §4.2 已逐行讲过**，这里只补三件事。
 
-**（1）`rename_source_key()`（`:1412`）——「名字对不上」的**唯一**入口**
+**（1）`rename_source_key()`（`:1412`）——「名字对不上」的唯一入口**：加载（不 reverse）时先跑【全部】`WeightRenaming`（可链式多条），再跑【至多一条】`WeightConverter`（首个匹配即停）；保存（reverse）时顺序完全反过来。docstring 的理由：「there is no need for a Converter-then-Rename order because Converters act only on specific leaf patterns, so no subsequent Renamings should ever target their output.」第 3 步还有前缀修补（`:1472-1481`）：改名后若 meta state dict 里有带 / 不带 `base_model_prefix` 的两个版本，就自动补上或去掉一级前缀——这是「用 BaseModel 权重加载 ForXXX 模型」能工作的原因。
 
-1A3 展示了它的调用点，但没讲它的内部规则。规则很短但很硬：
+**（2）这一趟里还有 4 件与量化 / 并行相关的动作**：dtype 决策（`:1681-1703`，量化反序列化时保持 checkpoint dtype，否则按 `dtype_plan` / meta 参数 dtype）；量化算子挂载（`:1672-1679`，`param_needs_quantization()` 为真 → `mapping.quantization_operation = get_quantize_ops()`）；EP expert 索引（`:1705-1714`，op chain 里有 `MergeModulelist` → 传 `tensor_idx`，让 DTensor 按**整个 expert** 切；注释说它「isn't always `operations[0]`」，因为 FP8 quantizer 会在链头插 scale-decode op）；分片 / offload 决策（`:1716-1728`，meta 参数是 `DTensor` → `DtensorShardOperation`；`force_cpu=True` → 先落 cpu 再交给 accelerate，例子是 ~95 GiB 的 `qwen4_exp` 巨型 embedding）。
 
-```
-不 reverse（加载）时：先跑【全部】WeightRenaming（可以链式多条），再跑【至多一条】WeightConverter（首个匹配即停）
-reverse（保存）时：顺序完全反过来（先 converter 再 renaming）
-理由（docstring 原文）："there is no need for a Converter-then-Rename order because Converters
-act only on specific leaf patterns, so no subsequent Renamings should ever target their output."
-```
-
-第 3 步还有一段前缀修补（`:1472-1481`）：改名后如果 meta state dict 里有带 / 不带
-`base_model_prefix` 的两个版本，就自动补上或去掉一级前缀——这是「用 BaseModel 权重加载 ForXXX 模型」能工作的原因。
-
-**（2）这一趟里还有 4 件与量化 / 并行相关的动作**（都在循环体内，1A3 未展开）
-
-| 动作 | 行号 | 说明 |
-|------|------|------|
-| dtype 决策 | `:1681-1703` | 预算 `_dtype`：量化反序列化时保持 checkpoint dtype，否则按 `dtype_plan` / meta 参数 dtype |
-| 量化算子挂载 | `:1672-1679` | `param_needs_quantization()` 为真 → `mapping.quantization_operation = get_quantize_ops()` |
-| EP expert 索引 | `:1705-1714` | 若 op chain 里有 `MergeModulelist` → 传 `tensor_idx`，让 DTensor 分片按**整个 expert** 切（而不是切到 expert 内部）。注释特别说明它「isn't always `operations[0]`」，因为 FP8 quantizer 会在链头插一个 scale-decode op |
-| 分片 / offload 决策 | `:1716-1728` | meta 参数是 `DTensor` → `DtensorShardOperation`；`force_cpu=True` → 先落到 cpu 再交给 accelerate（注释举的例子是 ~95 GiB 的 `qwen4_exp` 巨型 embedding） |
-
-**（3）异步加载在这里收口，且有 3 个「退化回同步」的条件**
-
-`spawn_materialize()`（`:1244`）把「读盘 + cast + shard」塞进
-`ThreadPoolExecutor`（`GLOBAL_WORKERS = min(4, os.cpu_count() or 4)`，`:1233`，注释说明 16 线程反而会慢一倍）。
-三种情况会退化回同步（`:1629-1636`）：
-
-1. 环境变量 `HF_DEACTIVATE_ASYNC_LOAD` 为真
-2. `device_map` 含 `"disk"`（要控内存）
-3. **on-the-fly 量化**——否则后台线程会把全精度张量先塞满显存，主线程来不及量化
-
-第 3 条是量化和加载管线的第一个真实耦合点。第二个是第二趟：`mapping.convert()` 里
-**先跑完所有张量变换，最后才跑量化 op**（`WeightConverter.convert()` 里最后的 `if hf_quantizer is not None and self.quantization_operation is not None:` 分支，`:1214-1224`）。
+**（3）异步加载在这里收口，且有 3 个「退化回同步」的条件**：`spawn_materialize()`（`:1244`）把「读盘 + cast + shard」塞进 `ThreadPoolExecutor`（`GLOBAL_WORKERS = min(4, os.cpu_count() or 4)`，`:1233`，注释说 16 线程反而会慢一倍）。退化条件（`:1629-1636`）：① 环境变量 `HF_DEACTIVATE_ASYNC_LOAD` 为真；② `device_map` 含 `"disk"`；③ **on-the-fly 量化**（否则后台线程会把全精度张量先塞满显存，主线程来不及量化）。
+第 3 条是量化和加载管线的第一个真实耦合点；第二个是第二趟：`mapping.convert()` 里**先跑完所有张量变换，最后才跑量化 op**（`WeightConverter.convert()` 里 `if hf_quantizer is not None and self.quantization_operation is not None:` 分支，`:1214-1224`）。
 
 ### 4.3 流程图
 
 ```
-checkpoint 文件 (safetensors)
-  │  safe_open(...).get_slice(k)            ← 不 materialize，只拿 slice 对象
-  ▼
-merged_state_dict: {原始key: tensor_slice}
-  │
-  │  sorted(by dot_natural_key)             ← 保证 layers.2 在 layers.10 之前
-  ▼
-┌─────────────────────────── 第一趟：归类 ───────────────────────────┐
-│  rename_source_key(original_key)                                   │
-│    ├─ ① 跑全部 WeightRenaming（可链式）                             │
-│    │     └─ WeightTransform.rename_source_key()  :902  正则 match   │
-│    ├─ ② 跑首个匹配的 WeightConverter  → 返回 (renamed_key, src_pat) │
-│    └─ ③ base_model_prefix 的加/删（仅当 meta_state_dict 有那个 key） │
-│                                                                    │
-│  renamed_key ∈ meta_state_dict ?                                    │
-│   ├─ 是 → mapping = param_name_to_load[renamed_key]                 │
-│   │        = deepcopy(pattern_to_converter[src_pat])  ← 每目标一份  │
-│   │        mapping.add_tensor(...)                                  │
-│   │        + 挂 quantization_operation / tensor_idx / sharding_op   │
-│   │        + spawn_materialize()  → 线程池里读盘+cast+shard         │
-│   └─ 否 → _add_unmatched_checkpoint_key()  :1485                    │
-│            （PP 场景其它 stage 的 key → skipped_pp_keys，不算 unexpected）│
-└────────────────────────────────────────────────────────────────────┘
-  ▼
-param_name_to_load: {目标key: WeightConverter/WeightRenaming}
-  │
-  ▼
-┌─────────────────────────── 第二趟：计算 ───────────────────────────┐
-│  for each mapping:                                                 │
-│    materialize_tensors()          ← Future → Tensor（异步收口）     │
-│    for op in operations: op.convert(...)   ← Chunk/stack/transpose… │
-│    if quantization_operation: 再跑量化/反量化 op                     │
-│        ▼                                                           │
-│    set_param_for_module(model, target_name, param)  :1343          │
-│        （或 offload_and_maybe_resave_param → disk）                │
-└────────────────────────────────────────────────────────────────────┘
-  ▼
-loading_info = {missing_keys, unexpected_keys, mismatched_keys, conversion_errors, skipped_pp_keys}
-  │  + tokenizer/tie/finalize → _finalize_model_loading()   modeling_utils.py:4394
-  ▼
-model
+checkpoint 文件 (safetensors) → safe_open(...).get_slice(k)（不 materialize，只拿 slice 对象）→ merged_state_dict
+第一趟（归类）:  sorted(by dot_natural_key) → rename_source_key(original_key)  :902 正则 match
+  ① 全部 WeightRenaming（可链式） ② 首个匹配的 WeightConverter → (renamed_key, src_pat) ③ base_model_prefix 加/删
+  renamed_key ∈ meta_state_dict ?  是 → param_name_to_load[key] = deepcopy(pattern_to_converter[src_pat])
+      + add_tensor + 挂 quantization_operation/tensor_idx/sharding_op + spawn_materialize()（线程池读盘+cast+shard）
+    否 → _add_unmatched_checkpoint_key()  :1485（PP 其它 stage 的 key → skipped_pp_keys，不算 unexpected）
+第二趟（计算）:  materialize_tensors()（Future → Tensor）→ for op: op.convert(...)（Chunk/stack/transpose…）
+  → if quantization_operation: 再跑量化/反量化 → set_param_for_module(model, target_name, param)  :1343（或 offload_and_maybe_resave_param → disk）
+  ↓ loading_info = {missing, unexpected, mismatched, conversion_errors, skipped_pp_keys} → _finalize_model_loading()  modeling_utils.py:4394
 ```
 
 ### 4.4 与 1A3 的分工（避免重复）
@@ -579,63 +298,31 @@ model
 
 ## 五、`fusion_mapping.py`：方向恰好**反过来**
 
-**实测结论（别猜，我读了全文）**：它**不是**「把 fused 层拆成多个层」。
-
-它做的是**反方向**：**把运行时模型改成 fused 形态**，然后注册权重映射让**原始的、未 fuse 的 checkpoint 仍能加载**。
+**实测结论（读了全文）**：它**不是**「把 fused 层拆成多个层」，而是**反方向**——**把运行时模型改成 fused 形态**，然后注册权重映射让**原始的、未 fuse 的 checkpoint 仍能加载**。
 
 ```python
 # fusion_mapping.py:44  ModuleFusionSpec 的三个抽象点
 class ModuleFusionSpec:
     target_modules_patterns: tuple[str, ...] = ()
-    def is_fusable(self, module) -> bool: ...            # 这个模块能不能 fuse
-    def make_fused_class(self, original_cls) -> type: ... # 造运行时替换类
+    def is_fusable(self, module) -> bool: ...             # 这个模块能不能 fuse
+    def make_fused_class(self, original_cls) -> type: ...  # 造运行时替换类
     def make_transforms(self, config) -> list[WeightTransform]: ...  # 原始布局 ↔ fused 布局的映射
+# fusion_mapping.py:94  PatchEmbeddingsFusionSpec（唯一的 fusion 家族，_FUSION_REGISTRY :235）
+#   target_modules_patterns = (r"(^|\.)patch_embed$",)
+#   is_fusable: isinstance(proj, nn.Conv3d) and proj.stride == proj.kernel_size and proj.padding == (0,0,0)
+#               and proj.dilation == (1,1,1) and proj.groups == 1
 ```
 
-**唯一的 fusion 家族**（`_FUSION_REGISTRY`，`:235`）：`patch_embeddings`
+即**patch 之间不重叠的 Conv3d patch embedding → 等价的一个 `nn.Linear`**（`_FusedPatchEmbeddingMixin`，`:71`；运行时 `self.linear_proj` 取代 `self.proj`，`:77-85`）；配套权重映射是 `Conv3dToLinear`（`:129`）+ 一个 `WeightRenaming` 给 bias（`:135`）。**注册流程**（`_register_module_fusion()`，`:190`）：① `_discover_fusable_modules`（`:142`）在 `torch.device("meta")` 上实例化一遍、扫 `named_modules()`，按 pattern 预筛 → `is_fusable()` 结构判定（结果缓存进 `_FUSION_DISCOVERY_CACHE`，`:41`）；② `register_patch_mapping(...)`（交给 `monkey_patching.py:85`）；③ `spec.make_transforms(config)`；④ source_patterns 撞车 → raise（`:223`）；⑤ `register_checkpoint_conversion_mapping(model_type, existing + converters, overwrite=True)`。
 
-```python
-# fusion_mapping.py:94  PatchEmbeddingsFusionSpec
-target_modules_patterns = (r"(^|\.)patch_embed$",)
-def is_fusable(self, module):
-    proj = getattr(module, "proj", None)
-    return isinstance(proj, nn.Conv3d) and proj.stride == proj.kernel_size \
-        and proj.padding == (0,0,0) and proj.dilation == (1,1,1) and proj.groups == 1
-```
-
-即：**patch 之间不重叠的 Conv3d patch embedding → 等价的一个 `nn.Linear`**
-（`_FusedPatchEmbeddingMixin`，`:71`；运行时 `self.linear_proj` 取代 `self.proj`，`:77-85`）。
-配套的权重映射是 `Conv3dToLinear`（`:129`）+ 一个 `WeightRenaming` 给 bias（`:135`）。
-
-**注册流程**（`_register_module_fusion()`，`:190`）：
-
-```
-1. _discover_fusable_modules(cls, config, ...)     :142
-     with torch.device("meta"): model = cls(config)      ← 在 meta 上实例化一遍，扫 named_modules()
-     按 target_modules_patterns 预筛 → is_fusable() 结构判定 → 得到 {类名: fused类}
-     （结果缓存进 _FUSION_DISCOVERY_CACHE，:41）
-2. register_patch_mapping(fusable_classes, overwrite=True)   ← 交给 monkey_patching.py:85
-3. converters = spec.make_transforms(config)
-4. 检查冲突：source_patterns 撞车 → raise（:223）—— 注释说明「WeightConverter 匹配首个 source 就停，冲突必须 early fail」
-5. register_checkpoint_conversion_mapping(model_type, existing + converters, overwrite=True)
-```
-
-**调用点唯一**：`from_pretrained`（`modeling_utils.py:4333-4335`），
-`fusion_config` 参数或 `config.fusion_config` 触发。默认不开（`if not fusion_config: return`，`:266`）。
-
-**和 monkey_patching 的关系**：`monkey_patching.py`（371 行）负责「在模型实例化**之前**把类换掉」
-（`register_patch_mapping` `:85`、`apply_patches` `:234`）。fusion 是它的一个用户。
-这一步在 `cls(config)` 之前完成，所以 `modeling_utils.py:4335` 必须在 `:4349` 的 `with ContextManagers(...)` 之前。
+**调用点唯一**：`from_pretrained`（`modeling_utils.py:4333-4335`），由 `fusion_config` 参数或 `config.fusion_config` 触发，默认不开（`:266`）。它必须在 `:4349` 的 `with ContextManagers(...)` **之前**，因为 `monkey_patching.py`（371 行）负责「在模型实例化**之前**把类换掉」（`register_patch_mapping` `:85`、`apply_patches` `:234`）。
 
 | 方向 | 谁 | 做什么 | 运行时布局 | checkpoint 布局 |
 |------|----|--------|-----------|----------------|
 | 常规映射 | `conversion_mapping.py` | checkpoint → 模型 | 模型说了算（如 fused QKV 拆开） | 任意 |
 | **fusion** | `fusion_mapping.py` | 模型 → fused 运行时 | **被改成 fused**（Conv3d→Linear） | **保持原样** |
 
-文档：`docs/source/en/fusion_mapping.md`（99 行），里面明确写了
-「Fusion mapping provides an opt-in way to replace model submodules at load time **while preserving the original checkpoint format**」
-和「Fusion registration is class-level: one compatible module class maps to one fused replacement class」。
-生成文件时用了 `# TODO: allow compatible fusions`（`:229`），所以当前只支持一个家族。
+文档 `docs/source/en/fusion_mapping.md`（99 行）明确写了「replace model submodules at load time **while preserving the original checkpoint format**」；生成文件时用了 `# TODO: allow compatible fusions`（`:229`），所以当前只支持一个家族。
 
 ---
 
@@ -645,151 +332,54 @@ def is_fusable(self, module):
 
 `ls src/transformers/quantizers/` → `__init__.py`、`auto.py`、`base.py`、`quantizers_utils.py` + **25 个 `quantizer_*.py`**。
 
-| 文件 | 类名 | `AUTO_QUANTIZER_MAPPING` key | `requires_calibration` |
-|------|------|------------------------------|----------------------|
-| `quantizer_aqlm.py` | `AqlmHfQuantizer` | `aqlm` | **True** |
-| `quantizer_auto_round.py` | `AutoRoundQuantizer` | `auto-round` | **True** |
-| `quantizer_awq.py` | `AwqQuantizer` | `awq` | **True** |
-| `quantizer_bitnet.py` | `BitNetHfQuantizer` | `bitnet` | **True** |
-| `quantizer_bnb_4bit.py` | `Bnb4BitHfQuantizer` | `bitsandbytes_4bit` | False |
-| `quantizer_bnb_8bit.py` | `Bnb8BitHfQuantizer` | `bitsandbytes_8bit` | False |
-| `quantizer_compressed_tensors.py` | `CompressedTensorsHfQuantizer` | `compressed-tensors` | **True** |
-| `quantizer_eetq.py` | `EetqHfQuantizer` | `eetq` | False |
-| `quantizer_fbgemm_fp8.py` | `FbgemmFp8HfQuantizer` | `fbgemm_fp8` | False |
-| `quantizer_finegrained_fp8.py` | `FineGrainedFP8HfQuantizer` | `fp8` **和** `mxfp8` | False |
-| `quantizer_fouroversix.py` | `FourOverSixHfQuantizer` | `fouroversix` | False |
-| `quantizer_fp_quant.py` | `FPQuantHfQuantizer` | `fp_quant` | False |
-| `quantizer_gemma.py` | `GemmaQuantizer` | `gemma` | **True** |
-| `quantizer_gptq.py` | `GptqHfQuantizer` | `gptq` | False |
-| `quantizer_higgs.py` | `HiggsHfQuantizer` | `higgs` | False |
-| `quantizer_hqq.py` | `HqqHfQuantizer` | `hqq` | False |
-| `quantizer_metal.py` | `MetalHfQuantizer` | `metal` | False |
-| `quantizer_mxfp4.py` | `Mxfp4HfQuantizer` | `mxfp4` | False |
-| `quantizer_nvfp4.py` | `NVFP4HfQuantizer` | `nvfp4` | False |
-| `quantizer_quanto.py` | `QuantoHfQuantizer` | `quanto` | False |
-| `quantizer_quark.py` | `QuarkHfQuantizer` | `quark` | **True** |
-| `quantizer_sinq.py` | `SinqHfQuantizer` | `sinq` | False |
-| `quantizer_spqr.py` | `SpQRHfQuantizer` | `spqr` | **True** |
-| `quantizer_torchao.py` | `TorchAoHfQuantizer` | `torchao` | False |
-| `quantizer_vptq.py` | `VptqHfQuantizer` | `vptq` | **True** |
+**`requires_calibration = True` 的 9 个**（**必须**用已量化好的 checkpoint，`pre_quantized=False` 会在 `HfQuantizer.__init__`（`base.py:91-95`）直接 raise）：
+`quantizer_aqlm.py` `AqlmHfQuantizer`(aqlm)、`quantizer_auto_round.py` `AutoRoundQuantizer`(auto-round)、`quantizer_awq.py` `AwqQuantizer`(awq)、`quantizer_bitnet.py` `BitNetHfQuantizer`(bitnet)、`quantizer_compressed_tensors.py` `CompressedTensorsHfQuantizer`(compressed-tensors)、`quantizer_gemma.py` `GemmaQuantizer`(gemma)、`quantizer_quark.py` `QuarkHfQuantizer`(quark)、`quantizer_spqr.py` `SpQRHfQuantizer`(spqr)、`quantizer_vptq.py` `VptqHfQuantizer`(vptq)。
 
-**注意 25 个类 ≠ 26 个 key**：`bitsandbytes` 一个 config 拆成 4bit/8bit 两个 key
-（`AutoHfQuantizer.from_config()`，`auto.py:207-215`），`fp8`/`mxfp8` 共用 `FineGrainedFP8HfQuantizer`
-（`auto.py:96-99` 的注释说明 MXFP8 复用同一条 dequant 路径，只是 E8M0 字节解包在 `Fp8Dequantize._dequantize_one` 里）。
+**其余 16 个 `requires_calibration = False`**（可走 on-the-fly）：
+`quantizer_bnb_4bit.py` `Bnb4BitHfQuantizer`(bitsandbytes_4bit)、`quantizer_bnb_8bit.py` `Bnb8BitHfQuantizer`(bitsandbytes_8bit)、`quantizer_eetq.py` `EetqHfQuantizer`(eetq)、`quantizer_fbgemm_fp8.py` `FbgemmFp8HfQuantizer`(fbgemm_fp8)、`quantizer_finegrained_fp8.py` `FineGrainedFP8HfQuantizer`(**`fp8` 和 `mxfp8` 共用**)、`quantizer_fouroversix.py` `FourOverSixHfQuantizer`(fouroversix)、`quantizer_fp_quant.py` `FPQuantHfQuantizer`(fp_quant)、`quantizer_gptq.py` `GptqHfQuantizer`(gptq)、`quantizer_higgs.py` `HiggsHfQuantizer`(higgs)、`quantizer_hqq.py` `HqqHfQuantizer`(hqq)、`quantizer_metal.py` `MetalHfQuantizer`(metal)、`quantizer_mxfp4.py` `Mxfp4HfQuantizer`(mxfp4)、`quantizer_nvfp4.py` `NVFP4HfQuantizer`(nvfp4)、`quantizer_quanto.py` `QuantoHfQuantizer`(quanto)、`quantizer_sinq.py` `SinqHfQuantizer`(sinq)、`quantizer_torchao.py` `TorchAoHfQuantizer`(torchao)。
 
-另外 `quantization_config.py` 里的 `QuantizationMethod` 枚举（`utils/quantization_config.py:43-68`）
-有 **25 个成员**，与上表的 26 个 key 对应（多出的那个是 `bitsandbytes` → `bitsandbytes_4bit` / `bitsandbytes_8bit`；
-另外 `fouroversix` 对应 `FOUR_OVER_SIX`、`auto-round` 对应 `AUTOROUND`）。
+**25 个类 ≠ 26 个 key**：`bitsandbytes` 一个 config 拆成 4bit/8bit 两个 key（`AutoHfQuantizer.from_config()`，`auto.py:207-215`），`fp8`/`mxfp8` 共用 `FineGrainedFP8HfQuantizer`（`auto.py:96-99` 注释说明 MXFP8 复用同一条 dequant 路径，只是 E8M0 字节解包在 `Fp8Dequantize._dequantize_one` 里）。`utils/quantization_config.py:43-68` 的 `QuantizationMethod` 枚举有 **25 个成员**（另外 `fouroversix` 对应 `FOUR_OVER_SIX`、`auto-round` 对应 `AUTOROUND`）。
 
 ### 6.2 `HfQuantizer` 基类要求子类实现什么
 
-`quantizers/base.py:73`。**实测真正的 `@abstractmethod` 只有两个**（`grep -n abstractmethod` 只命中 `:14` import、`:269`、`:273`）：
+`quantizers/base.py:73`。**实测真正的 `@abstractmethod` 只有两个**（`grep -n abstractmethod` 只命中 `:14` import、`:269`、`:273`）：`is_serializable`（`:269`）与 property `is_trainable`（`:272`）。其余全是**有默认实现的钩子**（覆盖才生效），按加载时序排：
 
-```python
-# quantizers/base.py:269
-@abstractmethod
-def is_serializable(self): ...
+| 钩子 | 行号 | 默认行为 / 何时被调用 |
+|------|------|---------|
+| `requires_calibration`（类属性）/ `validate_environment` | `:83` / `:136` | `False`（`__init__` 里 `not pre_quantized and requires_calibration` → raise，`:91-95`）/ `return`（`auto.py:358-361` **和** `_get_device_map()` 里再来一次，`accelerate.py:373`） |
+| `update_dtype` / `update_device_map` / `param_element_size` / `adjust_max_memory` | `:99` / `:111` / `:123` / `:126` | 默认原样返回；bnb 的 `None` → 当前 GPU（`quantizer_bnb_4bit.py:102-115`）；bnb-4bit 的 `param_element_size` 返回 `0.5`（`:83-89`）、max_memory 乘 0.90（`:97-100`）——**device_map 自动规划才能算对显存** |
+| `update_tp_plan` / `update_ep_plan` / `get_weight_conversions` / `update_weight_conversions` | `:144` / `:148` / `:294` / `:297` | 原样返回 / `[]` / `weight_conversions + self.get_weight_conversions()`；给 scale/block 参数补并行规则（实测 `quantizer_mxfp4.py:213-224` 给 GptOss 加 4 条 `grouped_gemm`，EP 版 `:226-237`）；调用点 `conversion_mapping.py:2003`——**quantizer 能改写整条映射管线** |
+| `preprocess_model` / `_process_model_before_weight_loading` / `_convert_model_for_quantization` | `:155` / `:152` / `:276` | 设 `is_quantized` / `quantization_method`；若 `pre_quantized` 先 `_convert_model_for_quantization()`（按 `MODULES_TO_PATCH_FOR_QUANTIZATION` 替换模块）；再调 `_process_model_before_weight_loading()`（bnb 在这里把 `nn.Linear` 换成 `bnb.nn.Linear4bit`，`quantizer_bnb_4bit.py:121-143`）；调用点 `modeling_utils.py:4354` |
+| `param_needs_quantization` / `get_quantize_ops` | `:130` / `:289` | **`False`**（默认不量化任何参数）/ `raise NotImplementedError`；调用点 `core_model_loading.py:1673`，决定是否挂 `quantization_operation` |
+| `postprocess_model` / `_process_model_after_weight_loading` | `:176` / `:173` | 写 `config.quantization_config`；`pre_quantized and dequantize` → `remove_quantization_config()`，否则 `_assign_is_quantized()`；再调 `_process_model_after_weight_loading()`（bnb 设 `is_loaded_in_4bit`，`quantizer_bnb_4bit.py:145-148`）；调用点 `modeling_utils.py:4417` |
+| `is_qat_trainable` / `is_compileable`（property）/ `dequantize` / `_dequantize` / `get_state_dict_and_metadata` | `:256` / `:261` / `:208` / `:222` / `:265` | `False`（训练 / `torch.compile` 前检查）/ 走 `_dequantize` / `None, {}`（保存时） |
 
-@property                # :272
-@abstractmethod
-def is_trainable(self): ...
-```
-
-其余全是**有默认实现的钩子**（覆盖才生效）。按加载时序排：
-
-| 钩子 | 行号 | 默认行为 | 何时被调用 |
-|------|------|---------|-----------|
-| `requires_calibration`（类属性） | `:83` | `False` | `__init__` 校验：`not pre_quantized and requires_calibration` → raise（`:91-95`） |
-| `validate_environment(*args, **kwargs)` | `:136` | `return` | `auto.py:358-361`**和** `_get_device_map()` 里再来一次（`accelerate.py:373`） |
-| `update_dtype(dtype)` | `:99` | 原样返回 | 让量化方法强制 dtype |
-| `update_device_map(device_map)` | `:111` | 原样返回 | bnb 的典型用法：`None` → 当前 GPU（`quantizer_bnb_4bit.py:102-115`） |
-| `param_element_size(model, name, param)` | `:123` | `param.element_size()` | 给 `compute_module_sizes()` 用——bnb-4bit 返回 `0.5`（`quantizer_bnb_4bit.py:83-89`），**device_map 自动规划才能算对显存** |
-| `adjust_max_memory(max_memory)` | `:126` | 原样返回 | bnb 乘 0.90 留余量（`quantizer_bnb_4bit.py:97-100`） |
-| `update_tp_plan(config)` | `:144` | 原样返回 | 给 scale/block 参数补 TP 规则。实测例子：`quantizer_mxfp4.py:213-224` 给 GptOss 加 4 条 `grouped_gemm` |
-| `update_ep_plan(config)` | `:148` | 原样返回 | 同上，EP 版（`quantizer_mxfp4.py:226-237`） |
-| `preprocess_model(model, dtype=None, **kwargs)` | `:155` | 设 `is_quantized` / `quantization_method`，若 `pre_quantized` 先 `_convert_model_for_quantization()`，再调 `_process_model_before_weight_loading()` | `modeling_utils.py:4354` |
-| `_process_model_before_weight_loading(model, **kwargs)` | `:152` | `return model` | bnb 在这里把 `nn.Linear` 换成 `bnb.nn.Linear4bit`（`quantizer_bnb_4bit.py:121-143`） |
-| `_convert_model_for_quantization(model)` | `:276` | 按 `MODULES_TO_PATCH_FOR_QUANTIZATION` 替换成专用量化模块 | — |
-| `param_needs_quantization(model, name, **kwargs)` | `:130` | **`False`**（即默认不量化任何参数） | `core_model_loading.py:1673`，决定是否给 transform 挂 `quantization_operation` |
-| `get_quantize_ops()` | `:289` | `raise NotImplementedError` | 同上；返回一个 `ConversionOps`（如 `Fp8Quantize`、`Bnb4bitQuantize`） |
-| `get_weight_conversions()` | `:294` | `[]` | 见下 |
-| `update_weight_conversions(weight_conversions)` | `:297` | `return weight_conversions + self.get_weight_conversions()` | `conversion_mapping.py:2003`——**quantizer 能改写整条映射管线** |
-| `postprocess_model(model, **kwargs)` | `:176` | 写 `config.quantization_config`；`pre_quantized and dequantize` → `remove_quantization_config()`，否则 `_assign_is_quantized()`；再调 `_process_model_after_weight_loading()` | `modeling_utils.py:4417` |
-| `_process_model_after_weight_loading(model, **kwargs)` | `:173` | `return model` | bnb 设 `is_loaded_in_4bit`（`quantizer_bnb_4bit.py:145-148`） |
-| `is_qat_trainable` / `is_compileable`（property） | `:256` / `:261` | `False` | 训练 / `torch.compile` 前检查 |
-| `dequantize(model, dtype)` / `_dequantize(...)` | `:208` / `:222` | 走 `_dequantize` | — |
-| `get_state_dict_and_metadata(model)` | `:265` | `None, {}` | 保存时 |
-
-**`update_weight_conversions` 的 docstring 是本节最值得读的一段**（`:297-309`）：
-
-> Loading runs ``renamings → converters → (dequant → merge → concat)``. Dequant
-> has to happen *before* any merge/concat op because those operations aren't
-> aware of per-block scales, so the per-expert (weight, scale) pairs need to be
-> collapsed into full-precision tensors first.
-
-**翻译**：FP8 checkpoint 里每个 expert 的权重旁边还有一块 scale。如果先 `MergeModulelist` 把
-8 个 expert stack 起来，scale 就找不回自己的主人了。所以 dequant op **必须被插到 chain 的最前面**
-（注意 `core_model_loading.py:1705-1708` 的注释也说了同一件事：`MergeModulelist`「isn't always `operations[0]`」，
-因为 FP8 quantizer 会在前面插一个 scale-decode op）。
+**`update_weight_conversions` 的 docstring 是本节最值得读的一段**（`:297-309`）：「Loading runs ``renamings → converters → (dequant → merge → concat)``. Dequant has to happen *before* any merge/concat op because those operations aren't aware of per-block scales, so the per-expert (weight, scale) pairs need to be collapsed into full-precision tensors first.」
+**翻译**：FP8 checkpoint 里每个 expert 的权重旁边还有一块 scale。如果先 `MergeModulelist` 把 8 个 expert stack 起来，scale 就找不回自己的主人了。所以 dequant op **必须被插到 chain 的最前面**（`core_model_loading.py:1705-1708` 的注释也说了同一件事：`MergeModulelist`「isn't always `operations[0]`」）。
 
 ### 6.3 一次量化加载的全流程（ASCII）
 
 ```
 from_pretrained(quantization_config=BitsAndBytesConfig(load_in_4bit=True), ...)
-  │
-  │ ① 选 quantizer + 改环境
-  ├─ get_hf_quantizer(config, quantization_config, device_map, ...)      quantizers/auto.py:334
-  │    ├─ config.quantization_config 里已有？（= pre_quantized）
-  │    │    └─ AutoHfQuantizer.supports_quant_method()   :282  认识这个 quant_method 吗？
-  │    ├─ merge_quantization_configs()                   :232  模型自带的 vs 用户传的，谁优先
-  │    └─ AutoHfQuantizer.from_config()                  :198
-  │         └─ bitsandbytes → 按 load_in_8bit 补后缀（:207-215）
-  │         └─ AUTO_QUANTIZER_MAPPING[quant_method](cfg, pre_quantized=...)   :223-224
-  │  │
-  ├─ hf_quantizer.validate_environment(device_map=..., weights_only=...)   auto.py:358
-  ├─ device_map = hf_quantizer.update_device_map(device_map)                auto.py:362
-  ├─ config = hf_quantizer.update_tp_plan(config)                           auto.py:363
-  └─ config = hf_quantizer.update_ep_plan(config)                           auto.py:364
-  │
-  │ ② 建骨架 + 改模型（此时权重还是 meta，随便改结构）
-  ├─ config = copy.deepcopy(config)                        modeling_utils.py:4348
-  ├─ with ContextManagers(model_init_context):             modeling_utils.py:4349
-  │      model = cls(config)                               ← meta 骨架
-  │      patch_output_recorders(model)
-  │      hf_quantizer.preprocess_model(model, dtype=dtype, device_map=...)  :4354
-  │        base.py:155
-  │         ├─ model.is_quantized = True ; model.quantization_method = ...
-  │         ├─ if pre_quantized: self._convert_model_for_quantization(model)   base.py:276
-  │         │     按 MODULES_TO_PATCH_FOR_QUANTIZATION 把模块换成专用量化模块
-  │         └─ self._process_model_before_weight_loading(model, ...)          base.py:152
-  │               └─ bnb 在这里 replace_with_bnb_linear(...)   quantizer_bnb_4bit.py:138
-  │
-  │ ③ 取权重映射（量化会改写它）
-  ├─ weight_conversions = get_model_conversion_mapping(model, key_mapping, hf_quantizer)
-  │    conversion_mapping.py:1902 → :2003
-  │      weight_conversions = hf_quantizer.update_weight_conversions(weight_conversions)
-  │        （FP8 dequantize 模式：给每条现有 WeightConverter 的 operations 头部插 Fp8Dequantize）
-  │
-  │ ④ 加载（可能「边读边量化」）
-  ├─ model._get_dtype_plan(dtype)                        modeling_utils.py:4364
-  ├─ cls._load_pretrained_model(...)                     modeling_utils.py:4393 → :4436
-  │     └─ convert_and_load_state_dict_in_model(...)     core_model_loading.py:1511
-  │          ├─ param_needs_quantization(model, renamed_key)?
-  │          │     True → mapping.quantization_operation = hf_quantizer.get_quantize_ops()   :1678
-  │          ├─ has_on_the_fly_quantization → 禁用异步线程        :1628
-  │          └─ 第二趟：mapping.convert() 里先跑张量变换，再跑量化 op
-  │
-  │ ⑤ 后处理
-  ├─ accelerate_dispatch(model, hf_quantizer, device_map, ...)   modeling_utils.py:4413
-  │    （仅当 device_map 跨多设备或含 disk）
-  ├─ model.hf_quantizer = hf_quantizer ; hf_quantizer.postprocess_model(model)   :4416-4419
-  │     base.py:176 → 子类 _process_model_after_weight_loading()
-  └─ return model
+  │ ① 选 quantizer + 改环境：get_hf_quantizer(...)  quantizers/auto.py:334
+  │    config 已有 quantization_config？（= pre_quantized）→ supports_quant_method() :282；merge_quantization_configs() :232
+  │    AutoHfQuantizer.from_config() :198 → bnb 按 load_in_8bit 补后缀（:207-215）→ AUTO_QUANTIZER_MAPPING[quant_method](cfg, pre_quantized=...)  :223-224
+  │    validate_environment  auto.py:358 ; update_device_map :362 ; update_tp_plan :363 ; update_ep_plan :364
+  │ ② 建骨架 + 改模型（权重还是 meta）：copy.deepcopy(config)  modeling_utils.py:4348 ; with ContextManagers(model_init_context): :4349
+  │    model = cls(config) ← meta 骨架 ; hf_quantizer.preprocess_model(...) :4354 → base.py:155
+  │      is_quantized = True ; if pre_quantized: _convert_model_for_quantization  base.py:276 ; _process_model_before_weight_loading  base.py:152
+  │      → bnb replace_with_bnb_linear  quantizer_bnb_4bit.py:138
+  │ ③ 取权重映射：get_model_conversion_mapping(...)  conversion_mapping.py:1902 → :2003
+  │      （FP8 dequantize 模式：给每条 WeightConverter 的 operations 头部插 Fp8Dequantize）
+  │ ④ 加载：cls._load_pretrained_model(...)  modeling_utils.py:4393 → :4436 → convert_and_load_state_dict_in_model  core_model_loading.py:1511
+  │      param_needs_quantization? True → mapping.quantization_operation = ... :1678 ; has_on_the_fly_quantization → 禁用异步线程 :1628
+  │      第二趟：mapping.convert() 里先跑张量变换，再跑量化 op
+  │ ⑤ 后处理：accelerate_dispatch  modeling_utils.py:4413 ; postprocess_model  :4416-4419 → base.py:176 ; return model
 ```
 
 ### 6.4 「量化只在加载时发生」还是「运行时也能量化」？
 
-**实测答案：主路径是「加载时」。但这个二分法本身有点不准确，准确的划分是三条路**：
+**实测答案：主路径是「加载时」。但二分法不准，准确的划分是三条路**：
 
 | 路径 | 权重来源 | 触发 | 证据 |
 |------|---------|------|------|
@@ -797,25 +387,11 @@ from_pretrained(quantization_config=BitsAndBytesConfig(load_in_4bit=True), ...)
 | **B. 加载时 on-the-fly 量化** | checkpoint 是全精度 | `param_needs_quantization()` 返回 True → `get_quantize_ops()`，在灌权重那一刻量化 | `core_model_loading.py:1672-1679`；`base.py:289` |
 | **C. 加载后反量化** | 加载好的量化模型 | `HfQuantizer.dequantize(model, dtype)` | `base.py:208` / `_dequantize` `:222`；bnb 实现见 `quantizer_bnb_4bit.py:157-161` |
 
-**关键点**：路径 B（`requires_calibration=False` 的那 16 个后端才能走）**依然发生在 `from_pretrained` 内部**，
-不在 forward 里。而且它会主动**关掉异步加载**（`core_model_loading.py:1629-1636`，
-注释原文：「we also use sync loading to avoid worker threads loading full-precision tensors to GPU
-faster than the main thread can quantize them, which would cause a large memory spike」）。
-
-**反过来：`requires_calibration=True` 的 9 个后端**（aqlm / auto-round / awq / bitnet / compressed-tensors /
-gemma / quark / spqr / vptq）**必须**是预量化 checkpoint——`pre_quantized=False` 会在
-`HfQuantizer.__init__`（`base.py:91-95`）直接 raise。
-
-> **一条边界说明**：我没有在 `src/transformers/` 里找到任何「加载完之后再对模型调一次
-> `quantize(model)`」的公开 API（`grep -rn "def quantize"` 的命中全是模型内部的 VQ 模块或
-> integration 里的单张量量化函数）。torchao 之类的库自带运行时量化 API，但那是库外的。
-> 所以**本仓库里，量化是加载期的行为**——如需运行时改精度，得走 `dequantize()`（`base.py:208`）或库外工具。
+**关键点**：路径 B（`requires_calibration=False` 的那 16 个后端才能走）**依然发生在 `from_pretrained` 内部**，不在 forward 里，而且会主动**关掉异步加载**（`core_model_loading.py:1629-1636`，注释原文：「we also use sync loading to avoid worker threads loading full-precision tensors to GPU faster than the main thread can quantize them, which would cause a large memory spike」）。**边界说明**：`src/transformers/` 里没有任何「加载完之后再对模型调一次 `quantize(model)`」的公开 API（`grep -rn "def quantize"` 的命中全是模型内部的 VQ 模块或 integration 里的单张量量化函数）——**本仓库里，量化是加载期的行为**；如需运行时改精度，得走 `dequantize()`（`base.py:208`）或库外工具。
 
 ### 6.5 `QuantizedCache` 与本篇的关系（一句话）
 
-它是「**KV cache** 的量化」，跟本节权重量化**是两条独立的路**：实现在 `cache_utils.py:1884`
-（`class QuantizedCache(Cache)`），由 `GenerationConfig(cache_implementation="quantized")` 触发。
-**详见 [2A3_kv_cache.md](./2A3_kv_cache.md)**，本篇不展开。
+它是「**KV cache** 的量化」，跟权重量化**是两条独立的路**：实现在 `cache_utils.py:1884`（`class QuantizedCache(Cache)`），由 `GenerationConfig(cache_implementation="quantized")` 触发。**详见 [2A3_kv_cache.md](./2A3_kv_cache.md)**。
 
 ---
 
@@ -823,20 +399,7 @@ gemma / quark / spqr / vptq）**必须**是预量化 checkpoint——`pre_quanti
 
 ### 7.1 `base_model_tp_plan` 的真实形态
 
-它是 **config 类上的一个 dict 类属性**：`{参数名模式: 策略名}`。实测两个对照（把 2A5 里的例子看完）：
-
-```python
-# models/cohere2/modular_cohere2.py:72  —— 普通 GQA，没有 QK-Norm
-base_model_tp_plan = {
-    "layers.*.self_attn.q_proj": "colwise",
-    "layers.*.self_attn.k_proj": "colwise",
-    "layers.*.self_attn.v_proj": "colwise",
-    "layers.*.self_attn.o_proj": "rowwise",
-    "layers.*.mlp.gate_proj": "colwise",
-    "layers.*.mlp.up_proj": "colwise",
-    "layers.*.mlp.down_proj": "rowwise",
-}
-```
+它是 **config 类上的一个 dict 类属性**：`{参数名模式: 策略名}`。实测两个对照（`models/cohere2/modular_cohere2.py:72` 是普通 GQA，q/k/v 用 `colwise`、o_proj 用 `rowwise`；`models/olmo2/modular_olmo2.py:69` 有 QK-Norm）：
 
 ```python
 # models/olmo2/modular_olmo2.py:69  —— 有 QK-Norm，注意注释
@@ -845,184 +408,80 @@ base_model_tp_plan = {
     "layers.*.self_attn.k_proj": "colwise_gather_output",  # we need to replicate here due to the added norm on q and k
     "layers.*.self_attn.v_proj": "colwise_gather_output",  # we need to replicate here due to the added norm on q and k
     "layers.*.self_attn.o_proj": "rowwise_split_input",    # input is replicated due to the added norm on q and k
-    "layers.*.mlp.gate_proj": "colwise",
-    "layers.*.mlp.up_proj": "colwise",
-    "layers.*.mlp.down_proj": "rowwise",
+    "layers.*.mlp.gate_proj": "colwise", "layers.*.mlp.up_proj": "colwise", "layers.*.mlp.down_proj": "rowwise",
 }
 ```
 
-**同一段注释出现在 4 个模型的 modular 文件里，一字不差**（`grep -rn 'we need to replicate here due to the added norm on q and k'`
-实测 24 行命中：4 个 `modular_*.py` × 3 行 + 4 个生成的 `configuration_*.py` × 3 行）：
-`olmo2/modular_olmo2.py:70`、`olmo3/modular_olmo3.py:69`、`olmo_hybrid/modular_olmo_hybrid.py:110`、`flex_olmo/modular_flex_olmo.py:63`。
-**这就是「QK-Norm 破坏 fuse」的第一个直接证据**，见 7.3。
+**同一段注释出现在 4 个模型的 modular 文件里，一字不差**（`grep -rn 'we need to replicate here due to the added norm on q and k'` 实测 24 行 = 4 个 `modular_*.py` × 3 + 4 个生成的 `configuration_*.py` × 3）：`olmo2/modular_olmo2.py:70`、`olmo3/modular_olmo3.py:69`、`olmo_hybrid/modular_olmo_hybrid.py:110`、`flex_olmo/modular_flex_olmo.py:63`。**这是「QK-Norm 破坏 fuse」的第一个直接证据**（见 7.3）。
 
 **plan 是怎么拼起来的**（`distributed/mixin.py:60` `init_parallel_plans()`）：
 
 ```
 self._tp_plan = dict(模型类上的 _tp_plan)            # 如 MistralForCausalLM._tp_plan = {"lm_head": "colwise_gather_output"}
-if self.base_model is self:
-    self._tp_plan.update(self.config.base_model_tp_plan or {})     # ← config 上的 plan 是主力
+if self.base_model is self: self._tp_plan.update(self.config.base_model_tp_plan or {})   # ← config 上的 plan 是主力
 for name, module in self.named_children():
     if plan := getattr(module, "_tp_plan", None):
         self._tp_plan.update({f"{name}.{k}": v for k, v in plan.items()})   # 子模型贡献（自动加前缀）
 ```
 
-`tp_plan` property（`:87`）有一个分叉：`config.distributed_config.enable_expert_parallel` 为真时
-**返回 `_ep_plan` 而不是 `_tp_plan`**，且 EP plan 缺失会直接 raise（`:90-95`）。
-（`_tp_plan` 在生成文件里也是真的：`models/llama/modeling_llama.py:423`、
-`models/mistral/modeling_mistral.py:396`、`models/qwen2_moe/modeling_qwen2_moe.py:591` 都写着
-`_tp_plan = {"lm_head": "colwise_gather_output"}`——与 2A5 那处引用一致。）
+`tp_plan` property（`:87`）有个分叉：`config.distributed_config.enable_expert_parallel` 为真时**返回 `_ep_plan` 而不是 `_tp_plan`**，且 EP plan 缺失会直接 raise（`:90-95`）。（`_tp_plan` 在生成文件里也是真的：`models/llama/modeling_llama.py:423`、`models/mistral/modeling_mistral.py:396`、`models/qwen2_moe/modeling_qwen2_moe.py:591` 都写着 `_tp_plan = {"lm_head": "colwise_gather_output"}`。）
 
 ### 7.2 真实策略名全集（19 个）
 
-注册表是 `ParallelInterface`（`distributed/tensor_parallel.py:755`），实例名 `ALL_PARALLEL_STYLES`（`:785`）。
-`_global_mapping`（`:758`）**只有 torch.distributed 可用时才非空**（`if is_torch_distributed_available() else {}`）。
+注册表是 `ParallelInterface`（`distributed/tensor_parallel.py:755`），实例名 `ALL_PARALLEL_STYLES`（`:785`）。`_global_mapping`（`:758`）**只有 torch.distributed 可用时才非空**。
 
-| 策略名 | 类 | 行号 | 语义（读 docstring / `shard_param`） |
-|--------|----|------|------------------------------------|
+| 策略名 | 类 | 行号 | 语义 |
+|--------|----|------|------|
 | `colwise` | `ColwiseParallel` | `:161` | 权重 `Shard(0)`（Embedding `Shard(1)`）；输入 Replicate，输出 `Shard(-1)` |
-| `colwise_rep` | 同上 | — | `ColwiseParallel(input_layouts=Replicate(), output_layouts=Replicate())` |
-| `colwise_gather_output` | 同上 | — | 同上（别名，语义 = colwise + 输出 gather 回全量）**QK-Norm 模型专用** |
+| `colwise_rep` / `colwise_gather_output` | 同上 | — | `ColwiseParallel(input_layouts=Replicate(), output_layouts=Replicate())`；后者语义 = colwise + 输出 gather 回全量，**QK-Norm 模型专用** |
 | `rowwise` | `RowwiseParallel` | `:244` | 权重 `Shard(1)`、bias `Replicate`（Embedding 权重 `Shard(0)`）；输入 `Shard(-1)`，输出 Partial → 归约 |
-| `rowwise_rep` | 同上 | — | `RowwiseParallel(input_layouts=Replicate(), output_layouts=Replicate())` |
-| `rowwise_split_input` | 同上 | — | 同上（别名，语义 = 输入已是全量再切）**QK-Norm 模型专用** |
-| **`embedding_rowwise`** | `RowwiseParallel` | — | 输入 Replicate、输出 Replicate |
-| `sequence_parallel` | `SequenceParallel` | `:413` | 序列维切分 + norm 参数复制 |
-| `all_reduce` | `AllReduceParallel` | `:359` | 对模块的 partial 输出做 all-reduce |
-| `replicated_with_grad_allreduce` | `ReplicatedWithGradAllReduce` | `:337` | 参数复制、**梯度 partial**（Qwen3 的 per-head `q_norm`/`k_norm`） |
+| `rowwise_rep` / `rowwise_split_input` / **`embedding_rowwise`** | `RowwiseParallel` | — | `RowwiseParallel(input_layouts=Replicate(), output_layouts=Replicate())`；`rowwise_split_input` = 输入已是全量再切（**QK-Norm 专用**）；`embedding_rowwise` = 输入/输出都 Replicate |
+| `sequence_parallel` / `all_reduce` / `replicated_with_grad_allreduce` | `SequenceParallel` / `AllReduceParallel` / `ReplicatedWithGradAllReduce` | `:413` / `:359` / `:337` | 序列维切分 + norm 参数复制 / 对模块 partial 输出做 all-reduce / 参数复制、**梯度 partial**（Qwen3 的 per-head `q_norm`/`k_norm`） |
 | `mla_kv_a_proj` | `MlaKvAProjParallel` | `:372` | MLA 的 `kv_a_proj_with_mqa`：KV 部分走 colwise、RoPE 部分单独 all-reduce 梯度 |
-| `packed_colwise` | `PackedColwiseParallel` | `:441` | 打包权重（如 `gate_up_proj`）的 colwise |
-| `packed_rowwise` | `PackedRowwiseParallel` | `:503` | 打包权重的 rowwise |
-| `grouped_gemm` | `MoEParamShard(Shard(0), shards_expert_dim=True)` | `:520` | **专家并行**：专家维 `Shard(0)`，并把 `module.num_experts` 改成每卡本地数 |
-| `ep_router` | `EpRouterParallel` | `:656` | **专家并行**：router 输出的后处理切片 |
-| `moe_tp_experts` | `MoeExpertsParallel` | `:586` | **专家并行**：experts forward 的输入/输出变换 + all_reduce |
-| `moe_identity_expert` | `MoeIdentityParallel` | `:645` | 单个 `nn.Identity` 专家的去重缩放 |
-| `megamoe_router` | `RouterParallelMegaMoe` | `:723` | MegaMoE 的 router（dispatch 在 kernel 里，不做预切片） |
-| `megamoe_experts` | `MoeTensorParalellMegaMoeExperts` | `:735` | MegaMoE 的 experts |
+| `packed_colwise` / `packed_rowwise` | `PackedColwiseParallel` / `PackedRowwiseParallel` | `:441` / `:503` | 打包权重（如 `gate_up_proj`）的 colwise / rowwise |
+| `grouped_gemm` / `ep_router` / `moe_tp_experts` | `MoEParamShard(Shard(0), shards_expert_dim=True)` / `EpRouterParallel` / `MoeExpertsParallel` | `:520` / `:656` / `:586` | **专家并行**：专家维 `Shard(0)` 且 `module.num_experts` 改成本地数 / router 输出的后处理切片 / experts forward 的输入/输出变换 + all_reduce |
+| `moe_identity_expert` / `megamoe_router` / `megamoe_experts` | `MoeIdentityParallel` / `RouterParallelMegaMoe` / `MoeTensorParalellMegaMoeExperts` | `:645` / `:723` / `:735` | 单个 `nn.Identity` 专家的去重缩放 / MegaMoE 的 router（dispatch 在 kernel 里）/ experts |
 
 **应用流程**（`apply_tensor_parallelism()`，`:797`）：
 
 ```
 _validate_tp_plan_styles(model.tp_plan)     # :788  有未知策略名 → raise ValueError 并列出支持列表
 for name, module in model.named_modules():
-    # 第一遍：给每个参数装 DTensor 占位符（::参数名 查 plan，is_weight=True）
+    # 第一遍（is_weight=True，按 ::参数名 查 plan）：validate_param（:807，如 colwise 要求 output_size % tp_size == 0）
+    #   → shard_param（把 meta 参数换成 DTensor(Shard/N, src_data_rank=None)）
     for p_name, _ in module.named_parameters(recurse=False):
-        style = _get_parameter_tp_plan(f"{name}.{p_name}", model.tp_plan, is_weight=True)
-        style.validate_param(...)      # :807  例：colwise 要求 output_size % tp_size == 0
-        style.shard_param(...)         # 把 meta 参数换成 DTensor(Shard/N, src_data_rank=None)
-    # 第二遍：给模块装 forward（::模块名 查 plan，is_weight=False）
-    style.install_forward(module, tp_mesh)    # :819  包住 module.forward 做 input/output 变换
-    module._is_hooked = True
+        style = _get_parameter_tp_plan(f"{name}.{p_name}", model.tp_plan, is_weight=True)  # ; style.validate_param(...) ; style.shard_param(...)
+    # 第二遍（is_weight=False，按 ::模块名 查 plan）：install_forward(module, tp_mesh)（:819）包住 forward 做 input/output 变换 ; module._is_hooked = True
 ```
 
-**参数名匹配规则**（`distributed/tensor_parallel.py:74` `_get_parameter_tp_plan`）：
-- 先把层号换成通配符（`replace_layer_number_by_wildcard()`，`:35`）——注意它只换「点之间的数字」，
-  所以 `w1`/`w2` 这种参数名里的数字不会被误伤
-- 精确匹配整名；不中则退一级：`layers.0.self_attn.q_proj.weight` → 查 `layers.*.self_attn.q_proj`
-- `is_weight=True` 时还会再退一级到模块名（`weight` / `bias` 都能命中同一个 plan 条目）
-
-时序上，`apply_tensor_parallelism` 在 `from_pretrained` 里由 `maybe_distribute_model()` 调用
-（`modeling_utils.py:4369` → `distributed/mixin.py:183`），**在权重加载之前**——
-所以加载器看到的是 DTensor 占位符，能据此只读自己那一份（`core_model_loading.py:1719-1720` `DtensorShardOperation`）。
+**参数名匹配规则**（`distributed/tensor_parallel.py:74` `_get_parameter_tp_plan`）：先把层号换成通配符（`replace_layer_number_by_wildcard()`，`:35`，只换「点之间的数字」，所以 `w1`/`w2` 里的数字不会被误伤）→ 精确匹配整名；不中则退一级 `layers.0.self_attn.q_proj.weight` → `layers.*.self_attn.q_proj`；`is_weight=True` 时再退一级到模块名。时序上，`apply_tensor_parallelism` 由 `maybe_distribute_model()` 调用（`modeling_utils.py:4369` → `distributed/mixin.py:183`），**在权重加载之前**——所以加载器看到的是 DTensor 占位符，能据此只读自己那一份（`core_model_loading.py:1719-1720` `DtensorShardOperation`）。
 
 ### 7.3 为什么 RoPE / QK-Norm 导致**不能直接 fuse**
 
-这是本篇一个「看起来是玄学、实际有三条代码证据」的问题。
+**证据 1**：带 QK-Norm 的模型把 q/k/v 降级为 gather、o_proj 降级为 split（注释就写在 plan 上，见 7.1）。标准 TP + GQA 能省通信，是因为 `q_proj` 的 **colwise 输出分片**正好能被「这一卡上的那几个 head」直接消费。但加了 QK-Norm 后，`q_norm` 是**沿 head_dim 归一化的参数**，需要看到**完整的 head**（`Shard(-1)` 会把 head_dim 切一半，norm 就错了）→ q/k 之后必须 **gather 成全量**（`colwise_gather_output`），`o_proj` 的输入也就不再分片，得用 `rowwise_split_input`。
 
-**证据 1：带 QK-Norm 的模型把 q/k/v 降级为 gather、o_proj 降级为 split（注释就写在 plan 上）**
+**证据 2**：RoPE 让 Q/K 的权重布局和 V 不同类。`PermuteForRope`（`core_model_loading.py:428`）专门做「complex-RoPE 布局 ↔ split sin/cos 布局」的置换，而且**只对 q/k 做**（`permute_layer_names=["q_proj", "k_proj"]`，`conversion_mapping.py:479`）。所以「把 q/k/v 合成一个 `qkv` 权重」在 RoPE 这里**不保序**：必须先置换再拼，拆时必须先拆再置换（`Chunk` → `PermuteForRope`）。`kimi_k25`（`:469-481`）和 `step3p5_vision`（`:903`）两处都写了 `# Unfuse qkv and apply rope permutation`；而 `Tipsv2VisionModel`（`:1619-1636`）同样拆 fused QKV、却**没有**这个置换——「要不要置换」是逐模型的。
 
-```python
-# models/olmo2/modular_olmo2.py:70 （同样出现在 olmo3 / olmo_hybrid / flex_olmo）
-"layers.*.self_attn.q_proj": "colwise_gather_output",  # we need to replicate here due to the added norm on q and k
-...
-"layers.*.self_attn.o_proj": "rowwise_split_input",
-```
-
-**为什么**：标准的 TP + GQA 之所以能省通信，是因为 `q_proj` 的 **colwise 输出分片**
-正好能被「这一卡上的那几个 head」直接消费——也就是「大矩阵切列，激活不切，各算各的 head」。
-但加了 QK-Norm 之后，`q_norm` 是一个**沿 head_dim 归一化的参数**，
-它需要看到**完整的 head**（`Shard(-1)` 会把 head_dim 切一半，norm 就错了）。
-所以在 q/k 之后必须 **gather 成全量**（`colwise_gather_output` = 输出 Replicate），
-而 `o_proj` 的输入也就**不再是分片的**，得用 `rowwise_split_input`。
-
-**证据 2：RoPE 让 Q/K 的权重布局和 V 不同类**
-
-`PermuteForRope`（`core_model_loading.py:428`）的存在本身就是证据：
-它专门做「complex-RoPE 布局 ↔ split sin/cos 布局」的置换，而且**只对 q/k 做**
-（`permute_layer_names=["q_proj", "k_proj"]`，`conversion_mapping.py:479`）。
-所以「把 q/k/v 合成一个 `qkv` 权重」这件事，在 RoPE 这里是**不保序的**——
-必须先置换再拼；反过来拆的时候必须先拆再置换（`Chunk` → `PermuteForRope`）。
-`kimi_k25`（`:469-481`）和 `step3p5_vision`（`:903`）两处都写了注释 `# Unfuse qkv and apply rope permutation`；
-而 `Tipsv2VisionModel`（`:1619-1636`）同样拆 fused QKV、却**没有**这个置换——可见「要不要置换」是逐模型的。
-
-**证据 3：MLA 里 RoPE 部分和 KV 部分必须分开处理（最强的一条）**
-
-`MlaKvAProjParallel`（`distributed/tensor_parallel.py:372`）的 docstring 直接画了图：
+**证据 3（最强）**：MLA 里 RoPE 部分和 KV 部分必须分开处理。`MlaKvAProjParallel`（`distributed/tensor_parallel.py:372`）的 docstring 直接画了图：
 
 ```
-kv_a_proj_with_mqa 输出是 [kv_lora_rank + qk_rope_head_dim]（被 split 成两段）
-kv_a_proj_with_mqa
-        |
-        split
-        /    \
-    k_pass    k_rot  <-- "bypasses kv_b_proj"
-    |          |        (goes straight to attention, never touches kv_b_proj)
-kv_a_layernorm |
-    |          |
-kv_b_proj      |
-(colwise)      |
-    |          |
-    k_pass     k_rot
-        \\      /
-           cat
-            |
-        key_states
+kv_a_proj_with_mqa 输出 = [kv_lora_rank + qk_rope_head_dim]（split 成两段）
+      split → k_pass 路径：kv_a_layernorm → kv_b_proj (colwise) → k_pass
+              k_rot  <-- "bypasses kv_b_proj"（goes straight to attention, never touches kv_b_proj）
+      cat(k_pass, k_rot) → key_states
 ```
 
-为什么不能整体 colwise：`k_rot`（RoPE 那一段）**不经过 `kv_b_proj`**，
-所以它的梯度是 **partial** 的——只有 `kv_b_proj` 有 `built-in all_reduce_backward`。
-作者在 docstring 最后一句写得很清楚：
+为什么不能整体 colwise：`k_rot`（RoPE 那一段）**不经过 `kv_b_proj`**，所以它的梯度是 **partial** 的——只有 `kv_b_proj` 有 `built-in all_reduce_backward`。docstring 最后一句：「However, `k_rot` goes straight to attention, never touches `kv_b_proj`. So we need to average gradient across all ranks otherwise we only get gradient for one rank.」代码（`:400-410`）：按 `qk_rope_head_dim` 把输出切两段（`:408`），对 RoPE 那段补一次 `_AllReduceBackward`（`:409`），再 `torch.cat` 拼回。**这个策略还需要 config 上有 `qk_rope_head_dim`，否则直接 raise**（`:401-406`）。
 
-> However, `k_rot` goes straight to attention, never touches `kv_b_proj`.
-> So we need to average gradient across all ranks otherwise we only get gradient for one rank.
+**小结（可背）**：RoPE / QK-Norm 是**逐 head、跨 head_dim 的操作**，而 TP 的 colwise 恰好切在 head_dim 上。两者正交时可以靠 `colwise`/`rowwise` 省通信；一旦 norm 或 RoPE 需要看到完整 head，就必须 gather/split 或单独补梯度同步。
 
-代码里的实现（`:400-410`）就是：按 `qk_rope_head_dim` 把输出切两段
-（`output.split([output.shape[-1] - rope_dim, rope_dim], dim=-1)`，`:408`），
-对 RoPE 那段补一次 `_AllReduceBackward`（`:409`），再 `torch.cat` 拼回去。
-**这个策略还需要 config 上有 `qk_rope_head_dim`，否则直接 raise**（`:401-406`）——
-连配置字段都被这条约束反向「要求」出来了。
+### 7.4 与 `torch.distributed` 的关系：**DTensor + DeviceMesh**（实测）
 
-**小结（可以背下来的一句）**：RoPE / QK-Norm 是**逐 head、跨 head_dim 的操作**，
-而 TP 的 colwise 恰好切在 head_dim 上。两者正交时（纯 GQA + RoPE 放在 attention 内部）
-可以靠 `colwise`/`rowwise` 省通信；一旦 norm 或 RoPE 需要看到完整 head（QK-Norm，
-MLA 的 RoPE 段），就必须 gather/split，或者单独补梯度同步。
-
-### 7.4 与 `torch.distributed` 的关系：**DTensor + DeviceMesh**（实测，不是自定义 all-reduce 实现）
-
-**实测结论**：
-- 用 `torch.distributed.init_device_mesh()` 建 mesh（`distributed/utils.py:160` / `:197` / `:227`）
-- 参数用 `torch.distributed.tensor.distribute_tensor()` 变成 **`DTensor`**（`distributed/tensor_parallel.py:197`、`:272`、`:477`、`:515`、`:545` 共 5 处）
-- 通信交给 DTensor 的 `redistribute()`（`:223`、`:240`、`:288`、`:328`）——`Replicate ← Partial` 自动变成 all-reduce、
-  `Shard(1) ← Shard(-1)` 走 all-gather / reduce-scatter
-- **少数几处手写 collective**：`dist.all_reduce`（`:320` 纯推理 fast path、`:353` `_all_reduce_grads`）
-  和两个自定义 autograd Function：`_AllReduceForward`（`:552`）、`_AllReduceBackward`（`:565`，
-  注释解释了为什么不能用 DTensor 的 `Replicate` 反向：「DTensor's Replicate backward does incorrectly」——它会除以 world_size）
-
-**推理 fast path 值得单记**：当「输入已经是本地张量 + 模块是 `nn.Linear` + 不在 grad 模式」时，
-`ColwiseParallel.transform_inputs_pre_forward()`（`:201` 起；推理 fast path 在 `:205-208`）**直接原样返回，根本不包 DTensor**。
-`RowwiseParallel.transform_output_post_forward()`（`:311`；fast path 在 `:312-322`）也有一条纯 `dist.all_reduce` 的快路径。
-所以「推理 + 单卡权重已经是本地分片」时，TP 的开销退化到几乎只是一次 all-reduce。
-
-**MLP 被重新实现了一遍**：`gather_state_dict_for_save()`（`:825`）用 `DTensor.full_tensor()`
-把分片参数聚回完整 CPU 张量以便存盘——**每个 rank 都必须调用**，否则 collective 不齐会挂。
-
-**DTensor 与 kernel 的冲突**：DeepGEMM 这类 kernel 只吃本地张量，
-所以有 `_use_local_dtensor_params()`（`:93`）这个 contextmanager：forward 期间
-把 DTensor 换成 `to_local()`，结束后再换回去（还有一个「kernel 会新建 Parameter」的特例处理，`:108-120`）。
-
-**旧 API 已废弃**：`integrations/tensor_parallel.py:54` 的 `shard_and_distribute_module()` 会
-`warnings.warn(FutureWarning)` 然后 `raise RuntimeError`，提示改用
-`transformers.distributed.tensor_parallel.apply_tensor_parallelism`。
+- 用 `torch.distributed.init_device_mesh()` 建 mesh（`distributed/utils.py:160` / `:197` / `:227`）；参数用 `torch.distributed.tensor.distribute_tensor()` 变成 **`DTensor`**（`distributed/tensor_parallel.py:197`、`:272`、`:477`、`:515`、`:545` 共 5 处）；通信交给 DTensor 的 `redistribute()`（`:223`、`:240`、`:288`、`:328`）——`Replicate ← Partial` 自动变 all-reduce、`Shard(1) ← Shard(-1)` 走 all-gather / reduce-scatter。
+- **少数几处手写 collective**：`dist.all_reduce`（`:320` 纯推理 fast path、`:353` `_all_reduce_grads`）和两个自定义 autograd Function：`_AllReduceForward`（`:552`）、`_AllReduceBackward`（`:565`，注释解释为什么不能用 DTensor 的 `Replicate` 反向：「DTensor's Replicate backward does incorrectly」——它会除以 world_size）。
+- **推理 fast path**：当「输入已是本地张量 + 模块是 `nn.Linear` + 不在 grad 模式」时，`ColwiseParallel.transform_inputs_pre_forward()`（`:201` 起，fast path `:205-208`）**直接原样返回，根本不包 DTensor**；`RowwiseParallel.transform_output_post_forward()`（`:311`，fast path `:312-322`）也有一条纯 `dist.all_reduce` 的快路径。所以「推理 + 单卡权重已是本地分片」时，TP 开销退化到几乎只是一次 all-reduce。
+- **存盘 / kernel 冲突**：`gather_state_dict_for_save()`（`:825`）用 `DTensor.full_tensor()` 把分片参数聚回完整 CPU 张量——**每个 rank 都必须调用**，否则 collective 不齐会挂。DeepGEMM 这类 kernel 只吃本地张量，所以有 `_use_local_dtensor_params()`（`:93`）contextmanager：forward 期间把 DTensor 换成 `to_local()`（「kernel 会新建 Parameter」的特例见 `:108-120`）。
+- **旧 API 已废弃**：`integrations/tensor_parallel.py:54` 的 `shard_and_distribute_module()` 会 `warnings.warn(FutureWarning)` 后 `raise RuntimeError`，提示改用 `transformers.distributed.tensor_parallel.apply_tensor_parallelism`。
 
 ---
 
@@ -1030,73 +489,38 @@ MLA 的 RoPE 段），就必须 gather/split，或者单独补梯度同步。
 
 ### 8.1 `integrations/moe.py` 真实内容：**不是**分片逻辑，而是 forward 内核分派
 
-582 行的结构（实测）：
-
 | 内容 | 行号 | 说明 |
 |------|------|------|
-| `batched_mm_experts_forward` | `:112` | 用 `torch.bmm` + `gate_up_proj[expert_ids]` 的朴素实现；**处理 EP sentinel**（`expert_ids.clamp(0, num_experts-1)`，`:132`），注释说明 sentinel 位的路由权重已被 router 置 0 |
-| `_grouped_mm_fallback` 系列 | `:179`-`:306` | 无原生 `grouped_mm` 时的 autograd 兜底（含 backward） |
-| `_grouped_linear` | `:339` | 按 offsets 做分组 GEMM 的封装 |
-| `grouped_mm_experts_forward` | `:377` | 主力实现：按专家排序 → `histc` 算 offsets → 两段 grouped linear → 按 `inv_perm` 还原。**EP sentinel 处理写得极其详细**（`:405-419`，15 行注释解释为什么只需要一次 pre-mask + 一次 post-mask） |
+| `batched_mm_experts_forward` | `:112` | `torch.bmm` + `gate_up_proj[expert_ids]` 的朴素实现；**处理 EP sentinel**（`expert_ids.clamp(0, num_experts-1)`，`:132`） |
+| `_grouped_mm_fallback` 系列 / `_grouped_linear` | `:179`-`:306` / `:339` | 无原生 `grouped_mm` 时的 autograd 兜底（含 backward）/ 按 offsets 做分组 GEMM 的封装 |
+| `grouped_mm_experts_forward` | `:377` | 主力实现：按专家排序 → `histc` 算 offsets → 两段 grouped linear → 按 `inv_perm` 还原。**EP sentinel 处理极详细**（`:405-419`） |
 | `ExpertsInterface` + `ALL_EXPERTS_FUNCTIONS` | `:481` / `:506` | 注册表：`deepgemm` / `batched_mm` / `grouped_mm` / `sonicmoe` |
 | `use_experts_implementation` | `:523` | 装饰器：把 `Experts` 类的 `forward` 换成按 `config._experts_implementation` 分派的版本；顺带注入 `has_gate`/`has_bias`/`is_transposed`/`is_concatenated` |
 
-**它的 EP 相关性**在这一句（`grouped_mm_experts_forward` 的注释）：
-
-> EP sentinel handling: leave `expert_ids` unclamped so the sort pushes sentinels to the tail,
-> `histc(max=num_experts-1)` drops them from `tokens_per_expert`, and grouped_mm skips rows beyond `offsets[-1]`
-
-即：EP 下「不属于本 rank 的专家」被 router 打成 sentinel（索引 = `num_local_experts`），
-experts forward 要能优雅地跳过它们。**分派本身不在这里**。
+它的 EP 相关性在这一句注释：「EP sentinel handling: leave `expert_ids` unclamped so the sort pushes sentinels to the tail, `histc(max=num_experts-1)` drops them…」——即 EP 下「不属于本 rank 的专家」被 router 打成 sentinel（索引 = `num_local_experts`），experts forward 要能优雅跳过它们。**分派本身不在这里**。
 
 ### 8.2 EP 的真实实现：`config.enable_expert_parallel=True` → 走 `base_model_ep_plan`
 
-**入口**：`DistributedConfig(enable_expert_parallel=True)`（`distributed/configuration_utils.py:50`）
-→ `model.tp_plan` property 改返回 `_ep_plan`（`distributed/mixin.py:87-97`）。
-
-**plan 的真实形态**（实测，`deepseek_v2` / `qwen3_vl_moe` / `glm4_moe` / `minimax` 等 **14 个模型**定义了真实 dict，另有 2 处显式 `= None`）：
+**入口**：`DistributedConfig(enable_expert_parallel=True)`（`distributed/configuration_utils.py:50`）→ `model.tp_plan` property 改返回 `_ep_plan`（`distributed/mixin.py:87-97`）。plan 真实形态（实测：`deepseek_v2` / `qwen3_vl_moe` / `glm4_moe` / `minimax` 等 **14 个模型**定义了真实 dict，另有 2 处显式 `= None`）：
 
 ```python
 # models/deepseek_v2/modular_deepseek_v2.py:86
 base_model_ep_plan = {
-    "layers.*.mlp.gate": "ep_router",
-    "layers.*.mlp.experts.gate_up_proj": "grouped_gemm",
-    "layers.*.mlp.experts.down_proj": "grouped_gemm",
-    "layers.*.mlp.experts": "moe_tp_experts",
+    "layers.*.mlp.gate": "ep_router", "layers.*.mlp.experts": "moe_tp_experts",
+    "layers.*.mlp.experts.gate_up_proj": "grouped_gemm", "layers.*.mlp.experts.down_proj": "grouped_gemm",
 }
+# ① gate : ep_router → EpRouterParallel.transform_output_post_forward()  :700
+#    router 每卡「复制地」跑一遍；后处理：非本卡专家 score 置 0、index 置 -1；本卡专家全局 id → 本地 id（idx % num_local_experts）；
+#    丢弃的槽位置成 sentinel = num_local_experts（grouped_gemm 跳过）（docstring 有 4 token × top_k=4 × 128 experts × EP=8 数值例子，:671-698）
+# ② experts : moe_tp_experts → MoeExpertsParallel  :586（输入去 DTensor → _AllReduceBackward；输出若分片 → _AllReduceForward）
+# ③ gate_up_proj / down_proj : grouped_gemm → MoEParamShard  :520（专家维 Shard(0)；num_experts 改 per-rank 本地数，:535-543，与 ① 的 sentinel 一致）
 ```
 
-**四个策略是怎么配合的**：
-
-```
-① layers.*.mlp.gate  : ep_router      → EpRouterParallel.transform_output_post_forward()  :700
-   router 在每张卡上「复制地」跑一遍（同样的输入 → 同样的全局专家 id / 权重）
-   ↓ 后处理：
-     - 非本卡专家：score 置 0、index 置 -1
-     - 本卡专家：全局 id 重映射成本地 id（idx % num_local_experts）
-     - 被丢弃的槽位置成 sentinel = num_local_experts（grouped_gemm 会跳过）
-   （docstring 里有一个 4 token × top_k=4 × 128 experts × EP=8 的完整数值例子，:671-698）
-
-② layers.*.mlp.experts  : moe_tp_experts → MoeExpertsParallel          :586
-   - 输入：hidden_states 去 DTensor → _AllReduceBackward（梯度侧 all-reduce）
-   - 输出：若参数是分片的 → _AllReduceForward（把各卡的部分专家输出加起来）
-
-③ layers.*.mlp.experts.gate_up_proj / down_proj : grouped_gemm → MoEParamShard  :520
-   - 权重 dim 0（专家维）Shard(0)
-   - module.num_experts 改成 per-rank 本地专家数（:535-543）
-     → 与 ① 里 router 打的 sentinel 值保持一致
-```
-
-**它解决的问题**：单卡放不下 `num_experts × 2I × H` 的专家权重。切法是把**专家维度**分到不同卡
-（而不是像普通 TP 那样切每个矩阵的行/列），所以每张卡只持有 `num_experts / ep_size` 个专家。
+**它解决的问题**：单卡放不下 `num_experts × 2I × H` 的专家权重。切法是把**专家维度**分到不同卡（而不是像普通 TP 那样切每个矩阵的行/列），所以每张卡只持有 `num_experts / ep_size` 个专家。
 
 ### 8.3 通信是 **all-reduce，不是 all-to-all**（一个需要纠正的常见说法）
 
-**实测**：`grep -rn "all_to_all" src/ docs/` → **零命中**。
-`distributed/tensor_parallel.py` 里所有 collective 只有 `all_reduce`（`:320`、`:353`、`:558`、`:582`）
-和 DTensor 的 `redistribute()`。
-
-**这意味着本仓库的 EP 是「token 复制 + 输出求和」模型，而不是 MoE 教科书里的 all-to-all dispatch**：
+**实测**：`grep -rn "all_to_all" src/ docs/` → **零命中**。`distributed/tensor_parallel.py` 里所有 collective 只有 `all_reduce`（`:320`、`:353`、`:558`、`:582`）和 DTensor 的 `redistribute()`。**本仓库的 EP 是「token 复制 + 输出求和」模型**：
 
 ```
 每张卡都持有【全部 token】（hidden_states 不去切）
@@ -1104,20 +528,10 @@ base_model_ep_plan = {
 各卡的输出在 TP group 上 all-reduce 加起来
 ```
 
-代价是**每张卡都对全部 token 做了一次「大部分是零」的 GEMM**（计算浪费），
-换来的好处是**不需要 all-to-all 的通信/缓冲复杂度**。
-`batched_mm_experts_forward` 的注释甚至直说了这一点（`:128-131`）：
+代价是**每张卡都对全部 token 做了一次「大部分是零」的 GEMM**（计算浪费），换来**不需要 all-to-all 的通信/缓冲复杂度**——`batched_mm_experts_forward` 的注释直说了（`:128-131`）：「we pay the wasted GEMM compute because batched_mm has no offset to skip.」
+**唯一的例外**是 DeepGEMM 的 **MegaMoE**（`RouterParallelMegaMoe` `:723` / `MoeTensorParalellMegaMoeExperts` `:735`）：它在 **kernel 内部**做 EP dispatch + combine + per-rank token 分片（docstring：「Mega MoE handles EP dispatch inside the kernel」），所以**关掉了** `MoeExpertsParallel` 的梯度同步 hook（注释 `:735-742`）。但 transformers 侧**没有发起 all-to-all**。
 
-> we pay the wasted GEMM compute because batched_mm has no offset to skip.
-
-**唯一的例外**：DeepGEMM 的 **MegaMoE**（`RouterParallelMegaMoe` `:723` / `MoeTensorParalellMegaMoeExperts` `:735`）
-在 **kernel 内部**做 EP dispatch + combine + per-rank token 分片（docstring 原文：
-「Mega MoE handles EP dispatch inside the kernel」），所以它**关掉了** `MoeExpertsParallel`
-的梯度同步 hook（`MoeTensorParalellMegaMoeExperts` 注释，`:735-742`）。
-但那是 kernel 自己的事——transformers 侧**没有发起 all-to-all**。
-
-> 结论：如果某篇文章说「transformers 的 EP 用 all-to-all」，那是把 vLLM/SGLang 的做法套过来了。
-> **本仓库当前代码不是这样**，以实测为准。
+> 结论：若某篇文章说「transformers 的 EP 用 all-to-all」，那是把 vLLM/SGLang 的做法套过来了。**本仓库当前代码不是这样**，以实测为准。
 
 ---
 
@@ -1125,140 +539,39 @@ base_model_ep_plan = {
 
 实测：`ls src/transformers/integrations/` → **47 个 `.py` + 2 个子目录**（`heterogeneity/`、`mistral/`）。
 
-### 表 9.1 按用途分类
+- **A. 注意力后端 / 推理内核（11 个）**：`sdpa_attention.py`、`flash_attention.py`、`flex_attention.py`、`npu_flash_attention.py`、`msa_attention.py`（`MSA_SUPPORTED_TOPK` / `MSA_SUPPORTED_BLOCK_SIZE` / `MSA_SUPPORTED_HEAD_DIM`）、`eager_paged.py`、`sdpa_paged.py`、`flash_paged.py`、`hub_kernels.py`（`KERNELS_MIN_VERSION` / `KERNELS_MAX_VERSION`，`from_pretrained(use_kernels=True)` 的落点）、`deepgemm.py`（SM90/SM100 + nvcc JIT，含 MegaMoE）、`sonicmoe.py`（CuteDSL）。
+- **B. 量化（22 个）**：与 `quantizers/` 一一对应——`aqlm.py`、`awq.py`、`bitnet.py`、`bitsandbytes.py`、`compressed_tensors.py`、`eetq.py`、`fbgemm_fp8.py`、`finegrained_fp8.py`、`fouroversix.py`、`fp_quant.py`、`gemma_quant.py`、`higgs.py`、`hqq.py`、`metal_quantization.py`、`mxfp4.py`、`nvfp4.py`、`quanto.py`、`quark.py`、`sinq.py`、`spqr.py`、`torchao.py`、`vptq.py`。**为什么是 25 → 23 → 22**：25 个 `quantizer_*.py` 里 23 个能找到实现文件，bnb 4bit/8bit 两文件**共用** `bitsandbytes.py`；**对不上号的两个**是 `quantizer_auto_round.py` 与 `quantizer_gptq.py`——`import` 指向库外的 `auto_round.inference.convert_model` / `optimum.gptq`（`quantizer_auto_round.py:50`、`quantizer_gptq.py:54`），`grep "from \.\.integrations"` 无命中。
+- **C/D/E. 并行·训练·其他**：`accelerate.py`（1023 行：`infer_auto_device_map` `:642`、`accelerate_dispatch` `:399`、`accelerate_disk_offload` `:459`、`compute_module_sizes` `:144`）、`tensor_parallel.py`（93 行 **shim**）、`fsdp.py`（re-export）、`moe.py`（582 行）、`tpu.py`、`heterogeneity/`；`deepspeed.py`（`_load_pretrained_model` 有独立 ZeRO-3 分支 `modeling_utils.py:4477`）、`liger.py`、`neftune.py`、`peft.py`（**直接 import `get_model_conversion_mapping`**，`integrations/peft.py:23`、`:222`，adapter 也要走权重映射）；`executorch.py`、`ggml.py`（GGUF/GGML 读写）、`tiktoken.py`（`convert_tiktoken_to_fast()`）、`integration_utils.py`、`mistral/`（`constants.py` 的 `TEKKEN_VOCAB_FILE` / `is_tekken_vocab_filename`）。
 
-**A. 注意力后端 / 推理内核（11 个）**
-
-| 文件 | 干什么 |
-|------|--------|
-| `sdpa_attention.py` | `sdpa` 后端（PyTorch 原生 SDPA） |
-| `flash_attention.py` | `flash_attention_2` 后端 |
-| `flex_attention.py` | `flex_attention` 后端 |
-| `npu_flash_attention.py` | Ascend NPU 的 flash attention |
-| `msa_attention.py` | MSA 后端（模块级常量 `MSA_SUPPORTED_TOPK` / `MSA_SUPPORTED_BLOCK_SIZE` / `MSA_SUPPORTED_HEAD_DIM`） |
-| `eager_paged.py` | paged attention 的 eager 实现 |
-| `sdpa_paged.py` | paged attention 的 sdpa 实现 |
-| `flash_paged.py` | paged attention 的 flash 实现 |
-| `hub_kernels.py` | Kernel Hub 内核的注册/替换（`KERNELS_MIN_VERSION` / `KERNELS_MAX_VERSION`），`from_pretrained(use_kernels=True)` 的落点 |
-| `deepgemm.py` | DeepGEMM 分组 GEMM 内核（SM90/SM100 + nvcc JIT），含 MegaMoE |
-| `sonicmoe.py` | SonicMoE 融合 MoE 内核（CuteDSL） |
-
-**B. 量化（22 个）**——与 `quantizers/` 里的 `get_quantize_ops()` / `get_weight_conversions()` 一一对应：
-
-| | | | |
-|---|---|---|---|
-| `aqlm.py` | `awq.py` | `bitnet.py` | `bitsandbytes.py` |
-| `compressed_tensors.py` | `eetq.py` | `fbgemm_fp8.py` | `finegrained_fp8.py` |
-| `fouroversix.py` | `fp_quant.py` | `gemma_quant.py` | `higgs.py` |
-| `hqq.py` | `metal_quantization.py` | `mxfp4.py` | `nvfp4.py` |
-| `quanto.py` | `quark.py` | `sinq.py` | `spqr.py` |
-| `torchao.py` | `vptq.py` | | |
-
-> **为什么是 25 → 23 → 22**：25 个 `quantizer_*.py` 里，**23 个**能在 `integrations/` 找到对应实现文件，
-> 而 `quantizer_bnb_4bit.py` 和 `quantizer_bnb_8bit.py` **共用**同一个 `bitsandbytes.py`，所以去重后是 **22 个文件**。
-> **对不上号的两个**是 `quantizer_auto_round.py` 和 `quantizer_gptq.py`——它们的 `import` 全部指向库外的
-> `auto_round.inference.convert_model` / `optimum.gptq`（`quantizer_auto_round.py:50`、`quantizer_gptq.py:54`），
-> `grep "from \.\.integrations"` 无命中。
-
-**C. 并行 / 分布式（6 个）**
-
-| 文件 | 干什么 |
-|------|--------|
-| `accelerate.py`（1023 行） | `device_map` 规划（`infer_auto_device_map` `:642`）、`dispatch_model`（`accelerate_dispatch` `:399`）、disk offload（`accelerate_disk_offload` `:459`）、显存估算（`compute_module_sizes` `:144`） |
-| `tensor_parallel.py`（93 行） | **向后兼容 shim**，真实现在 `distributed/tensor_parallel.py` |
-| `fsdp.py` | 向后兼容 re-export，真实现在 `distributed/fsdp.py` |
-| `moe.py`（582 行） | experts forward 的 4 种实现 + EP sentinel 处理 |
-| `tpu.py` | `tpu_spmd_dataloader` 等 TPU 专用工具 |
-| `heterogeneity/` | 异构设备配置（`configuration_utils.py`） |
-
-**D. 训练 / 微调（4 个）**
-
-| 文件 | 干什么 |
-|------|--------|
-| `deepspeed.py` | ZeRO 集成（`is_deepspeed_zero3_enabled`）；`_load_pretrained_model` 有独立的 ZeRO-3 分支（`modeling_utils.py:4477`） |
-| `liger.py` | Liger Kernel 的 Triton 融合内核 |
-| `neftune.py` | NEFTune 噪声嵌入微调 |
-| `peft.py` | PEFT adapter；**它直接 import 了 `get_model_conversion_mapping`**（`integrations/peft.py:23`、`:222`），因为 adapter 也要走权重映射 |
-
-**E. 其他 / 基础设施（5 个 + `__init__`）**
-
-| 文件 | 干什么 |
-|------|--------|
-| `executorch.py` | ExecuTorch 导出 |
-| `ggml.py` | GGUF / GGML 格式读写（`gguf_file` 路径） |
-| `tiktoken.py` | `convert_tiktoken_to_fast()`：tiktoken 编码 → `PreTrainedTokenizerFast` |
-| `integration_utils.py` | 通用工具（含 wandb 等第三方库的开关） |
-| `mistral/` | Mistral 原生格式（`constants.py` 的 `TEKKEN_VOCAB_FILE` / `is_tekken_vocab_filename`） |
-
-### 表 9.2 与本篇三个主题的交叉
-
-| 主题 | 相关文件 | 关键连接点 |
-|------|---------|-----------|
-| 权重映射 | `accelerate.py`（**不直接**，但 `accelerate_disk_offload()` 也吃 `weight_mapping`，调用点 `modeling_utils.py:4461`）、`peft.py:222` | `LoadStateDictConfig.weight_mapping` |
-| 量化 | 22 个量化文件 + `bitsandbytes.py` 等 | `HfQuantizer.get_quantize_ops()` / `get_weight_conversions()` |
-| 并行 | `accelerate.py`、`tensor_parallel.py`（shim）、`fsdp.py`、`moe.py`、`tpu.py`、`heterogeneity/` | `DistributedConfig` / `ALL_PARALLEL_STYLES` |
+**与本篇三个主题的交叉**：权重映射 → `accelerate.py`（`accelerate_disk_offload()` 也吃 `weight_mapping`，调用点 `modeling_utils.py:4461`）、`peft.py:222`；量化 → 22 个量化文件（`HfQuantizer.get_quantize_ops()` / `get_weight_conversions()`）；并行 → `accelerate.py` / `tensor_parallel.py` / `fsdp.py` / `moe.py` / `tpu.py` / `heterogeneity/`（`DistributedConfig` / `ALL_PARALLEL_STYLES`）。
 
 ---
 
 ## 十、实操决策树：显存不够了，按什么顺序试
 
-**先说清楚**：仓库文档里没有一条「官方背书」的严格顺序，但代码里的**注入点顺序**可以读出来。
-`from_pretrained` 里这几步的先后（`modeling_utils.py`）是：量化 → 并行 → device_map → offload。
+**先说清楚**：仓库文档里没有「官方背书」的严格顺序，但代码里的**注入点顺序**可以读出来：量化 → 并行 → device_map → offload。
 
 ```
 显存不够？
-  │
-  ├─ ① 【量化】成本最低、收益最大
-  │     from_pretrained(..., quantization_config=BitsAndBytesConfig(load_in_4bit=True))
-  │       或 load_in_4bit=True / load_in_8bit=True
-  │     └─ 注入点：get_hf_quantizer()  modeling_utils.py:4270  ← 最早执行的一步
-  │        · param_element_size() 会被 device_map 规划用来算「量化后」的显存
-  │          （bnb-4bit → 0.5 字节/参数，quantizer_bnb_4bit.py:83-89）
-  │        · adjust_max_memory() 会给规划留余量（bnb 乘 0.90，:97-100）
-  │     ⚠ 注意 requires_calibration=True 的 9 个后端必须用**已量化好的 checkpoint**
-  │
-  ├─ ② 【并行】单卡装得下「一份模型」但不装下「整份」
-  │     from_pretrained(..., distributed_config=DistributedConfig(tp_size=4))
-  │       或 enable_expert_parallel=True（MoE 模型）
-  │     └─ 注入点：cls.maybe_distribute_model(model, distributed_config, device_mesh)
-  │        modeling_utils.py:4369  →  distributed/mixin.py:183
-  │        · 旧写法「直接给 from_pretrained 传 tp_plan=/tp_size=」已 deprecated（:4200）
-  │        · 要求：模型有 base_model_tp_plan（model.supports_tp_plan，:4671）
-  │        · TP 会在**加载前**把参数换成 DTensor 占位符，所以每张卡只读自己那份
-  │          （core_model_loading.py:1719-1720）
-  │
-  ├─ ③ 【device_map 手动/自动分层】多卡 + CPU
+  ├─ ① 【量化】成本最低、收益最大 → get_hf_quantizer()  modeling_utils.py:4270（最早执行的一步）
+  │     from_pretrained(..., quantization_config=BitsAndBytesConfig(load_in_4bit=True))  或 load_in_4bit=True
+  │     · param_element_size() 被 device_map 规划用来算「量化后」显存（bnb-4bit → 0.5 字节/参数，quantizer_bnb_4bit.py:83-89）
+  │     · adjust_max_memory() 给规划留余量（bnb 乘 0.90，:97-100）；⚠ requires_calibration=True 的 9 个后端必须用已量化 checkpoint
+  ├─ ② 【并行】单卡装得下「一份模型」但不装下「整份」→ cls.maybe_distribute_model(...)  modeling_utils.py:4369 → distributed/mixin.py:183
+  │     from_pretrained(..., distributed_config=DistributedConfig(tp_size=4))  或 enable_expert_parallel=True（MoE）
+  │     · 旧写法「直接传 tp_plan=/tp_size=」已 deprecated（:4200）；要求模型有 base_model_tp_plan（supports_tp_plan :4671）
+  │     · TP 在**加载前**把参数换成 DTensor 占位符，每张卡只读自己那份（core_model_loading.py:1719-1720）
+  ├─ ③ 【device_map 分层】多卡 + CPU → _get_device_map()  modeling_utils.py:4373 → integrations/accelerate.py:338
   │     from_pretrained(..., device_map="auto", max_memory={0: "20GiB", "cpu": "60GiB"})
-  │     └─ 注入点：_get_device_map()  modeling_utils.py:4373
-  │        → integrations/accelerate.py:338  _get_device_map()
-  │        → :240 get_balanced_memory() → :642 infer_auto_device_map()
-  │        · "auto" = 在 max_memory 约束下自动切块（层为粒度，_no_split_modules）
-  │        · 三种字符串策略 "balanced" / "balanced_low_0" / "sequential"（docstring `:344-345`）
-  │        · HfQuantizer.param_element_size 直接影响这一步能不能算对
-  │
-  └─ ④ 【disk offload】最后的兜底（慢，但能跑起来）
-        from_pretrained(..., device_map="auto", offload_folder="./offload", offload_buffers=True)
-        └─ 三个真实的落点：
-           · _load_pretrained_model 里判断 "disk" in device_map.values() → accelerate_disk_offload()
-             modeling_utils.py:4461 → integrations/accelerate.py:459
-           · 单参数级别：core_model_loading.py:1765-1768 → offload_and_maybe_resave_param()  :1386
-           · 用完后：accelerate_dispatch()  modeling_utils.py:4413 → accelerate.py:399
-             （dispatch_model + 前向 hook；仅当 device_map 跨多设备或含 disk）
-        注意点：device_map 含 disk 时**异步加载被禁用**（core_model_loading.py:1629-1634），
-                因为要控制内存；GGUF checkpoint 不支持 disk offload（:4279-4285）
+  │     · "auto" = 在 max_memory 约束下自动切块（层为粒度，_no_split_modules）→ :240 get_balanced_memory() → :642 infer_auto_device_map()
+  │     · 字符串策略 "balanced" / "balanced_low_0" / "sequential"（docstring :344-345）；param_element_size 直接影响算不算得对
+  └─ ④ 【disk offload】兜底（慢，但能跑起来）→ device_map="auto", offload_folder="./offload", offload_buffers=True
+        · _load_pretrained_model 判断 "disk" in device_map.values() → accelerate_disk_offload()  modeling_utils.py:4461 → accelerate.py:459
+        · 单参数级：core_model_loading.py:1765-1768 → offload_and_maybe_resave_param() :1386；用完后 accelerate_dispatch()  :4413 → accelerate.py:399
+        · device_map 含 disk 时**异步加载被禁用**（core_model_loading.py:1629-1634）；GGUF 不支持 disk offload（:4279-4285）
 ```
 
-**四条顺序上的真实约束**：
-
-1. **量化必须在 device_map 规划之前**——因为 `param_element_size` / `adjust_max_memory` 都要参与估算。
-   代码上也是：`get_hf_quantizer`（`:4270`）远早于 `_get_device_map`（`:4373`）。
-2. **`update_device_map()` 会改你的 device_map**——bnb 的默认行为是「你没给 device_map 且没 CUDA？
-   就落到 cpu」（`quantizer_bnb_4bit.py:102-115`）。所以 `device_map` 的最终值不一定是你传的那个。
-3. **TP 和 device_map 是两套东西**：`maybe_distribute_model`（`:4369`）在 `_get_device_map`（`:4373`）**之前**。
-   TP 走 DTensor 分片，device_map 走 accelerate 的层间放置。
-4. **量化 + 并行有交叉钩子**：`update_tp_plan()` / `update_ep_plan()`（`base.py:144`/`:148`）
-   就是专门给量化权重（scale、block 之类的伴生参数）补并行规则的——
-   最典型的实测例子在 `quantizer_mxfp4.py:213-237`（给 GptOss 的 `*_blocks` / `*_scales` 加 4 条 `grouped_gemm`）。
+**四条顺序上的真实约束**：① **量化必须在 device_map 规划之前**（`param_element_size` / `adjust_max_memory` 要参与估算；`get_hf_quantizer`（`:4270`）远早于 `_get_device_map`（`:4373`））；② **`update_device_map()` 会改你的 device_map**——bnb 默认「你没给 device_map 且没 CUDA？就落到 cpu」（`quantizer_bnb_4bit.py:102-115`）；③ **TP 和 device_map 是两套东西**：`maybe_distribute_model`（`:4369`）在 `_get_device_map`（`:4373`）**之前**（TP 走 DTensor 分片，device_map 走 accelerate 的层间放置）；④ **量化 + 并行有交叉钩子**：`update_tp_plan()` / `update_ep_plan()`（`base.py:144`/`:148`）专给量化权重（scale、block 等伴生参数）补并行规则——实测在 `quantizer_mxfp4.py:213-237`（给 GptOss 的 `*_blocks` / `*_scales` 加 4 条 `grouped_gemm`）。
 
 ---
 
@@ -1266,10 +579,8 @@ base_model_ep_plan = {
 
 > **1A3 的加载是「按名字装」，2A6 的加载是「算出来」。**
 > `conversion_mapping.py` 用 93 个 model_type 的注册表 + 640 条 transform 描述「checkpoint 想变成什么」；
-> `core_model_loading.py:1511` 用两趟循环（先归类、后计算）把它执行掉——
-> 改名走 `WeightRenaming`，改布局走 `WeightConverter` + `ConversionOps`。
-> **量化和并行都是往这条管线里插一层**：量化插的是「先反量化再 merge/concat」的 op
-> 和「换掉 `nn.Linear`」的 preprocess，并行插的是「参数换成 DTensor 占位符 + forward 前后加通信」。
+> `core_model_loading.py:1511` 用两趟循环（先归类、后计算）把它执行掉——改名走 `WeightRenaming`，改布局走 `WeightConverter` + `ConversionOps`。
+> **量化和并行都是往这条管线里插一层**：量化插的是「先反量化再 merge/concat」的 op 和「换掉 `nn.Linear`」的 preprocess，并行插的是「参数换成 DTensor 占位符 + forward 前后加通信」。
 > `fusion_mapping.py` 方向相反——它把**运行时**模型改成 fused，让原始 checkpoint 能加载。
 > 记住三条硬事实：**量化是加载期行为**（没有公开的运行时 `quantize()` 入口）；
 > **TP 的 colwise 切在 head_dim 上，所以 QK-Norm / MLA 的 RoPE 段必须 gather 或单独补梯度**；

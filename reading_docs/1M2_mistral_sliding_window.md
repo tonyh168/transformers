@@ -1,25 +1,19 @@
 # Mistral 模型结构精读
 
-> 阅读目标:理解滑动窗口注意力（SWA）。
-> Mistral 对 Llama 的改动极少,几乎只有这一件事。
->
-> 核心源文件:`src/transformers/models/mistral/modular_mistral.py`（modular 文件,直接读差异）
-> 生成文件:`src/transformers/models/mistral/modeling_mistral.py`（由 `make fix-repo` 生成,勿直接编辑）
+> 阅读目标：理解滑动窗口注意力（SWA）。Mistral 对 Llama 的改动极少，几乎只有这一件事。
+> 源文件：`src/transformers/models/mistral/modular_mistral.py`（modular，直接读差异）；生成物 `modeling_mistral.py`（`make fix-repo` 生成，勿直接编辑）
 
 ---
 
 ## 前置知识
 
-读这篇之前需要理解 [1M1_llama_structure.md](./1M1_llama_structure.md) 里的：
-- `LlamaAttention`：GQA、QKV 投影、RoPE、KV cache
-- `LlamaDecoderLayer`：Pre-Norm + 残差结构
+[1M1_llama_structure.md](./1M1_llama_structure.md)：`LlamaAttention`（GQA / QKV 投影 / RoPE / KV cache）、`LlamaDecoderLayer`（Pre-Norm + 残差）。
 
 ---
 
 ## modular 文件说明
 
-`modular_mistral.py` 的开头直接 `from ..llama.modeling_llama import LlamaAttention, LlamaDecoderLayer, ...`，
-然后只覆盖有差异的部分。
+`modular_mistral.py` 开头直接 `from ..llama.modeling_llama import LlamaAttention, LlamaDecoderLayer, ...`，只覆盖有差异的部分（整个文件 ~170 行，Llama 有的东西一字不写）：
 
 ```
 MistralAttention     继承 LlamaAttention     ← 只改了这一行
@@ -28,56 +22,30 @@ MistralModel         继承 LlamaModel         ← 只改 mask 选择逻辑
 MistralForCausalLM   继承 LlamaForCausalLM   ← 几乎原样
 ```
 
-整个文件 ~170 行。Llama 有的东西，这里一字不写。
-
 ---
 
 ## 唯一核心差异：滑动窗口注意力（SWA）
 
-### 标准注意力的问题
+标准 causal attention 里第 `t` 个 token 能看到 `0` 到 `t-1` 的所有 token（`O(n²)`，KV cache 随长度增长）。SWA 让每个 token 只看**最近 `W` 个 token**（`W` = `sliding_window`，Mistral 7B 默认 4096），更早的上下文靠堆叠多层间接传递（第 `k` 层理论上能看到 `k×W` 以内）。
 
-在标准 causal attention 里，序列第 `t` 个 token 可以看到位置 `0` 到 `t-1` 的所有 token。
-序列越长，KV cache 越大，注意力矩阵也越大（`O(n²)`）。
-
-### 滑动窗口的思路
-
-每个 token 只看**最近 `W` 个 token**（`W` = `sliding_window`，Mistral 7B 默认 4096）。
-更早的上下文通过堆叠多层间接传递——第 `k` 层理论上能看到距离 `k×W` 以内的上下文。
-
-### 代码实现
-
-**第一处：attention forward（`modular_mistral.py:78-88`）**
+**第一处：attention forward（`modular_mistral.py:78-88`）**——只多了一个参数。`attention_interface` 是分发器，按后端（eager / sdpa / flash）选实现，每种都理解 `sliding_window`：
 
 ```python
 attn_output, attn_weights = attention_interface(
-    self,
-    query_states,
-    key_states,
-    value_states,
-    attention_mask,
-    dropout=0.0 if not self.training else self.attention_dropout,
+    self, query_states, key_states, value_states, attention_mask,
     scaling=self.scaling,
     sliding_window=getattr(self.config, "sliding_window", None),  # main diff with Llama
     **kwargs,
 )
 ```
 
-就加了这一个参数。`attention_interface` 是个分发器，会根据当前后端
-（eager / sdpa / flash）选择不同实现，每种实现都理解 `sliding_window`。
-
-**第二处：mask 选择（`modeling_mistral.py:364`）**
+**第二处：mask 选择（`modeling_mistral.py:364`）**——`LlamaModel` 固定用 `create_causal_mask`，`MistralModel` 多做一次分支：
 
 ```python
-mask_function = (
-    create_causal_mask
-    if self.config.sliding_window is None
-    else create_sliding_window_causal_mask
-)
+mask_function = create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
 ```
 
-`LlamaModel` 固定用 `create_causal_mask`；`MistralModel` 在这里做了一个分支。
-
-**第三处：mask 逻辑本身（`masking_utils.py:92-99`）**
+**第三处：mask 逻辑本身（`masking_utils.py:92-99`）**：
 
 ```python
 def sliding_window_overlay(sliding_window: int) -> Callable:
@@ -86,46 +54,19 @@ def sliding_window_overlay(sliding_window: int) -> Callable:
     return mask_function
 ```
 
-最终的 `create_sliding_window_causal_mask` 是
-`causal_mask（只看过去）` AND `sliding_window_overlay（只看最近 W 个）`
-的组合，用 `and_masks` 合并。
+`create_sliding_window_causal_mask` = `causal_mask（只看过去）` AND `sliding_window_overlay（只看最近 W 个）`，用 `and_masks` 合并。
 
 ---
 
 ## 对 KV Cache 的影响
 
-标准 Llama 推理时 KV cache 随序列长度无限增长。
-开启 SWA 后，**只需要保留最近 `W` 个位置的 K、V**，cache 大小变为常数。
+标准 Llama 推理时 KV cache 随长度无限增长；SWA 后**只需保留最近 `W` 个位置的 K、V**，cache 大小变为常数。
 
 ### 裁剪到底是谁做的？（实测修正）
 
-我的初稿写的是「cache 仍然用 `DynamicCache`，裁剪由 attention 实现（sdpa / flash）处理，
-或者靠 mask 把超出窗口的 score 置 `-inf`」。**这个说法是错的**，实测后的真实链路是：
+初稿写「cache 仍用 `DynamicCache`，裁剪由 attention 后端处理，或靠 mask 把超出窗口的 score 置 `-inf`」——**是错的**。真实链路分两步：
 
-**第一步：`DynamicCache` 会「变形」成一堆 `DynamicSlidingWindowLayer`。**
-`modeling_mistral.py:357` 确实写的是 `DynamicCache(config=self.config)`——
-但 `DynamicCache.__init__` 会根据 config 逐层选类
-（`cache_utils.py:1791-1793`）：
-
-```python
-layer_types, layer_kwargs = get_layer_types_and_kwargs(decoder_config)
-layers = [DYNAMIC_LAYER_TYPE_MAPPING[layer_type](**layer_kwargs) for layer_type in layer_types]
-```
-
-而 `get_layer_types_and_kwargs`（`:1701`）在 config 没显式给 `layer_types` 时会**从字段推断**：
-
-```python
-# cache_utils.py:1708-1714
-if config.sliding_window is not None:
-    layer_types = ["sliding_attention" for _ in range(config.num_hidden_layers)]
-```
-
-Mistral 的 `sliding_window = 4096`（`configuration_mistral.py:80`），
-所以 32 层全部映射成 `sliding_attention`
-（`DYNAMIC_LAYER_TYPE_MAPPING`，`cache_utils.py:1223`）→ **每层都是 `DynamicSlidingWindowLayer`**。
-
-> 所以「用的是 `DynamicCache`」这句话**形式上对、实质上误导**：
-> `DynamicCache` 在这里只是个容器，真正干活的是它内部的 32 个滑动窗口层。
+**第一步：`DynamicCache` 会「变形」成一堆 `DynamicSlidingWindowLayer`。** `modeling_mistral.py:357` 写的确实是 `DynamicCache(config=self.config)`，但 `DynamicCache.__init__`（`cache_utils.py:1791-1793`）会按 config 逐层选类；而 `get_layer_types_and_kwargs`（`:1701`）在 config 没显式给 `layer_types` 时**从字段推断**（`cache_utils.py:1708-1714`：`sliding_window` 非 `None` → 全层 `sliding_attention`）。Mistral 的 `sliding_window = 4096`（`configuration_mistral.py:80`），于是 32 层全部映射成 `sliding_attention`（`DYNAMIC_LAYER_TYPE_MAPPING`，`cache_utils.py:1223`）→ **每层都是 `DynamicSlidingWindowLayer`**。**「用的是 `DynamicCache`」形式上对、实质上误导**：它只是容器，真正干活的是内部的 32 个滑动窗口层。
 
 **第二步：裁剪是 cache 层自己做的**（`cache_utils.py:245-254`）：
 
@@ -138,31 +79,9 @@ if not self.record_past:
     self.values = full_value_states[:, :, -self.sliding_window + 1 :, :]
 ```
 
-**注意三个细节**：
+三个细节：存 `sliding_window - 1` 个（**不是** `sliding_window`）；返回的是**未裁剪**的完整状态（`return full_key_states, full_value_states`，`:261`）；`get_mask_sizes()`（`:265`）返回 `kv_offset = max(cumulative_length - sliding_window + 1, 0)`，让 mask 知道窗口在绝对坐标里的位置。
 
-| 细节 | 事实 |
-|------|------|
-| 存几个 | `sliding_window - 1`，**不是** `sliding_window` |
-| 返回什么 | `return full_key_states, full_value_states`（`:261`）——**返回未裁剪的完整状态** |
-| mask 怎么对齐 | `get_mask_sizes()`（`:265`）返回 `kv_offset = max(cumulative_length - sliding_window + 1, 0)`，让 mask 知道当前窗口在绝对坐标里的位置 |
-
-**为什么返回未裁剪的**：当前这一步的 query 需要看到刚进来的那些 token，
-而 cache 里只留 `W-1` 个历史 + 本步的 `query_length` 个新 token，
-两者拼起来才是本步注意力真正需要的范围。**裁剪是为了省显存，不是为了限制本步的计算范围**——
-限制范围是 mask 的职责。
-
-> 完整链路（2A3 实测）：
-> `configuration_mistral.py:80`（`sliding_window=4096`）
-> → `modeling_mistral.py:357`（`DynamicCache`）
-> → `cache_utils.py:1709-1710`（推断出 `sliding_attention`）
-> → `:1226`（映射到 `DynamicSlidingWindowLayer`）
-> → `:1793`（实例化）。
-> 详见 [2A3_kv_cache.md](./2A3_kv_cache.md)。
-
-### 一句话
-
-cache 大小 = `(W-1) × num_kv_heads × head_dim × 2 × dtype`，**与序列长度无关**。
-Mistral 7B（`W=4096`，8 个 KV 头，`head_dim=128`）在 fp16 下约 **0.5 GiB 封顶**。
+**为什么返回未裁剪的**：本步 query 需要看到刚进来的 token，而 cache 只留 `W-1` 个历史 + 本步 `query_length` 个新 token，拼起来才是本步注意力真正需要的范围。**裁剪是为了省显存，不是限制本步计算范围**——限制范围是 mask 的职责。于是 cache 大小 = `(W-1) × num_kv_heads × head_dim × 2 × dtype`，**与序列长度无关**；Mistral 7B（`W=4096`，8 个 KV 头，`head_dim=128`）fp16 下约 **0.5 GiB 封顶**。完整链路（2A3 实测）：`configuration_mistral.py:80` → `modeling_mistral.py:357`（`DynamicCache`）→ `cache_utils.py:1709-1710`（推断 `sliding_attention`）→ `:1226`（映射）→ `:1793`（实例化），详见 [2A3_kv_cache.md](./2A3_kv_cache.md)。
 
 ---
 
@@ -180,17 +99,13 @@ Mistral 7B（`W=4096`，8 个 KV 头，`head_dim=128`）在 fp16 下约 **0.5 Gi
 
 ## 一句话总结
 
-> Mistral = Llama + `sliding_window=W` 这一个参数。
-> 结构上没有新概念，读 modular 文件 5 分钟就能确认差异只有这一处。
+> Mistral = Llama + `sliding_window=W` 这一个参数。结构上没有新概念，读 modular 文件 5 分钟就能确认差异只有这一处。
 
 ---
 
 ## 下一步
 
-- **[1M3_mixtral_moe.md](./1M3_mixtral_moe.md)**：Mixtral 把 Mistral 的 MLP 换成混合专家（MoE），
-  是理解稀疏激活和路由的入口。
-- 或者先读 Mistral 的配置文件 `configuration_mistral.py`，看看 `sliding_window`、
-  `num_key_value_heads` 这些超参的默认值和约束。
+- **[1M3_mixtral_moe.md](./1M3_mixtral_moe.md)**：Mixtral 把 Mistral 的 MLP 换成混合专家（MoE），是理解稀疏激活和路由的入口。
 
 ---
 

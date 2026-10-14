@@ -196,7 +196,7 @@ footer b{color:var(--ink-2); font-weight:600}
   <div class="bar-in">
     <span class="bar-mark">精读进度</span>
     <div class="meter"><i id="meter"></i></div>
-    <span class="bar-count" id="count">0 / 24</span>
+    <span class="bar-count" id="count">0 / 25</span>
     <label class="tgl"><input type="checkbox" id="hideDone"> 隐藏已完成</label>
   </div>
 </div>
@@ -207,16 +207,16 @@ footer b{color:var(--ink-2); font-weight:600}
     <div class="eyebrow">入门 / 进阶 × 架构 / 模型结构</div>
     <h1>Transformers 精读地图</h1>
     <p class="lede">
-      24 篇源码精读，把 <code>transformers</code> 这个库拆成两条线：
+      25 篇源码精读，把 <code>transformers</code> 这个库拆成两条线：
       <b>架构</b>讲库怎么把模型跑起来（配置、权重加载、mask、cache、并行），
       <b>模型结构</b>讲主流模型长什么样（从 Llama 骨架一路到 GLM-5.3）。
       每一篇的每个断言都带真实行号，文末附可复现的验证命令。
     </p>
     <div class="stats">
-      <div class="stat"><b>24</b><span>篇文档</span></div>
-      <div class="stat"><b>28,401</b><span>行（含 TL;DR）</span></div>
+      <div class="stat"><b>25</b><span>篇文档</span></div>
+      <div class="stat"><b>16,419</b><span>行（含 TL;DR）</span></div>
       <div class="stat"><b>4</b><span>象限</span></div>
-      <div class="stat"><b>29</b><span>条流传甚广的说法被实测推翻</span></div>
+      <div class="stat"><b>31</b><span>条流传甚广的说法被实测推翻</span></div>
     </div>
   </header>
 
@@ -237,8 +237,8 @@ footer b{color:var(--ink-2); font-weight:600}
 
       <div class="path">
         <h3>完整系统</h3>
-        <p class="sub">按 2×2 逐象限推进 · 全 24 篇</p>
-        <div class="chain" data-chain="1A1 1A2 1A3 1M1 1M2 1M3 1M4 1M5 2A5 1A4 1A5 1A6 2A1 2A2 2A3 2A4 2A6 2M1 2M2 2M3 2M4 2M5 2M6 2M7"></div>
+        <p class="sub">按 2×2 逐象限推进 · 全 25 篇</p>
+        <div class="chain" data-chain="1A1 1A2 1A3 1M1 1M2 1M3 1M4 1M5 2A5 1A4 1A5 1A6 2A1 2A7 2A2 2A3 2A4 2A6 2M1 2M2 2M3 2M4 2M5 2M6 2M7"></div>
         <p class="why"><code>2A5</code> 特意插在中间——它决定你后面读源码的方式（读 modular 而不是生成文件）。</p>
       </div>
 
@@ -299,7 +299,7 @@ footer b{color:var(--ink-2); font-weight:600}
   <!-- 被推翻项 -->
   <section id="findings">
     <div class="sec-head">
-      <h2>29 条被实测推翻的说法</h2>
+      <h2>31 条被实测推翻的说法</h2>
       <span class="note">遇到和记忆冲突时，以这里为准</span>
     </div>
 
@@ -347,7 +347,7 @@ footer b{color:var(--ink-2); font-weight:600}
     </div>
 
     <div class="fgroup">
-      <h3><span class="tag">语义反了</span> 方向或含义搞错 <span class="cnt">6 条</span></h3>
+      <h3><span class="tag">语义反了</span> 方向或含义搞错 <span class="cnt">7 条</span></h3>
       <table class="ftable">
         <thead><tr><th>流传的说法</th><th>实测真相</th><th>出处</th></tr></thead>
         <tbody>
@@ -357,12 +357,13 @@ footer b{color:var(--ink-2); font-weight:600}
           <tr><td>专家并行用 all-to-all 通信</td><td><code>all_to_all</code> 全库<b>零命中</b>。是 all-reduce 合成输出</td><td>2A6</td></tr>
           <tr><td>ModernBERT 的滑动窗口与 Mistral 同向</td><td>它是<b>双向 band</b>（<code>abs(q_idx - kv_idx) &lt;= w</code>）；Mistral 是因果的（只看左边）。encoder 里「不能看未来」不成立</td><td>1M5</td></tr>
           <tr><td><code>_LazyAutoMapping</code> 靠 <code>__getattr__</code> 做惰性导入</td><td>它<b>没有</b> <code>__getattr__</code>。惰性来自 <code>_load_attr_from_module</code> 里的 <code>importlib.import_module</code></td><td>1A1</td></tr>
+          <tr><td>特化了 attention 的模型不能用 sdpa / FA</td><td>看<b>后端有没有对应的表达方式</b>，不是看模型有没有特化。Gemma 2 特化了 soft-cap，但 FA 签名里恰好有 <code>softcap</code> → <b>可用</b>；真正不能用的是 attention sink 那类（5 个模型），sdpa 没有「多加一列」的接口，作者才写 <code>_supports_sdpa = False</code></td><td>2A7</td></tr>
         </tbody>
       </table>
     </div>
 
     <div class="fgroup">
-      <h3><span class="tag">静默行为</span> 不报错，但结果不同 <span class="cnt">5 条</span></h3>
+      <h3><span class="tag">静默行为</span> 不报错，但结果不同 <span class="cnt">6 条</span></h3>
       <table class="ftable">
         <thead><tr><th>流传的说法</th><th>实测真相</th><th>出处</th></tr></thead>
         <tbody>
@@ -371,6 +372,7 @@ footer b{color:var(--ink-2); font-weight:600}
           <tr><td>BERT 的 MLM loss 只对被 mask 的位置算</td><td>模型算<b>全序列</b> cross-entropy；位置筛选在数据侧（collator 把其余位置填 <code>-100</code>）</td><td>1M5</td></tr>
           <tr><td>映射表用 <code>None</code> 表示「不支持该任务头」</td><td>模型映射表里 <code>None</code> 出现 <b>0 次</b>。<code>None</code> 只在 tokenizer / processor 映射里表示「可选依赖没装」</td><td>1A1</td></tr>
           <tr><td>LLaVA-NeXT 屏蔽 image token 的 loss</td><td>模型内<b>没有</b>这个屏蔽，图像位置默认要算 loss</td><td>2M6</td></tr>
+          <tr><td>不指定 <code>attn_implementation</code> 的模型都用 sdpa</td><td><code>_supports_sdpa</code> 默认是 <b><code>False</code></b>（要显式 opt-in）。没声明的 141 个文件里有 <b>13 个</b>走了 functional 接口 → 什么都不传时抛错被吞、<b>静默降级 eager</b>，<code>except</code> 里无任何日志</td><td>2A7</td></tr>
         </tbody>
       </table>
     </div>
@@ -431,7 +433,8 @@ footer b{color:var(--ink-2); font-weight:600}
       ["2A3","KV Cache 体系","Layer / Cache 双层架构、23 个类的家族树、显存算例与连续批处理的平行体系。","2A3_kv_cache.md"],
       ["2A4","RoPE 抽象层","6 个 init 函数；llama3 按波长分三段；两种 <code>rotate_half</code> 数学等价但权重不通用。","2A4_rope_abstraction.md"],
       ["2A5","代码生成机制","<code>modular_*.py</code> 如何生成 <code>modeling_*.py</code>；为什么不能直接改生成文件。","2A5_modular_code_generation.md"],
-      ["2A6","权重 / 量化 / 并行","跨实现权重映射；26 个量化 key；19 种张量并行策略与专家并行。","2A6_weights_quant_parallel.md"]
+      ["2A6","权重 / 量化 / 并行","跨实现权重映射；26 个量化 key；19 种张量并行策略与专家并行。","2A6_weights_quant_parallel.md"],
+      ["2A7","注意力接口契约","契约三层：硬契约 / 协商层（<code>**kwargs</code>，认不出就静默丢）/ 准入层（<code>_supports_*</code>）。为什么特化 eager 的模型仍能用 FA。","2A7_attention_contract.md"]
     ],
     "2M": [
       ["2M1","Gemma 2","软上限注意力（注意：默认后端下不生效）、交替局部 / 全局、<code>query_pre_attn_scalar</code>。","2M1_gemma2.md"],
